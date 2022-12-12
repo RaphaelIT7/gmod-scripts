@@ -1,3 +1,8 @@
+--[[
+	This script solves the CurTime's lack of precision
+
+	https://github.com/Facepunch/garrysmod-issues/issues/2502
+]]
 if SERVER then
 	hook.Add("Think", "Engine_TickCount", function()
 		SetGlobal2Int("engine_tickcount", engine.TickCount())

@@ -35,7 +35,7 @@ elseif SyncType == "net" then
 	if SERVER then
 		util.AddNetworkString("CurTime-Sync")
 		timer.Create("CurTime-Sync", SyncDelay, -1, function()
-			net.Start("CurTime-Sync", true) -- Can be unreliable because It is not needed to sync every second.
+			net.Start("CurTime-Sync", true) -- Can be unreliable because It is not needed to sync every time.
 				net.WriteFloat(CurTime())
 			net.Broadcast()
 		end)

@@ -4,7 +4,7 @@
 	https://github.com/Facepunch/garrysmod-issues/issues/2502
 ]]
 
-local SyncDelay = 1 -- in seconds
+local SyncDelay = 30 -- in seconds
 local SyncType = "net" -- can be NW2 or net
 
 if SyncType == "NW2" then
@@ -35,7 +35,7 @@ elseif SyncType == "net" then
 	if SERVER then
 		util.AddNetworkString("CurTime-Sync")
 		timer.Create("CurTime-Sync", SyncDelay, -1, function()
-			net.Start("CurTime-Sync", true) -- Can be skipped because It is not needed to sync every second.
+			net.Start("CurTime-Sync", true) -- Can be unreliable because It is not needed to sync every second.
 				net.WriteFloat(CurTime())
 			net.Broadcast()
 		end)

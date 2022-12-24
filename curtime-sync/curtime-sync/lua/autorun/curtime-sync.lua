@@ -3,7 +3,7 @@
 
 	https://github.com/Facepunch/garrysmod-issues/issues/2502
 
-	Created by: Raphael(https://github.com/RaphaelIT7)
+	Created by: RaphaelIT7(https://github.com/RaphaelIT7)
 ]]
 
 local SyncDelay = 30 -- in seconds
@@ -57,3 +57,6 @@ elseif SyncType == "net" then
 		end)
 	end
 end
+
+print("[CurTime-Sync] Successfully loaded.")
+print("[CurTime-Sync] Created by: RaphaelIT7(https://github.com/RaphaelIT7)")

@@ -1,21 +1,29 @@
 --[[
-	How to install:
-		1. Copy this file into the garrysmod/lua/menu folder
-		2. Open the menu.lua located in the garrysmod/lua/menu folder.
-		3. Add the following line to the menu.lua file:
-			include( "autoconnect.lua" )
-		4. Start Garry's Mod and enjoy using this script.
+	autoconnect:
+		This script willl automaticly connect you to the server as soon as a slot is available.
 
 	Commands:
 		autoconnect [ip] [password]
 
-	Values (ConVars):
-		autoconnect_maxretrys 1000
-		autoconnect_checkspeed 10  amount of seconds to wait before checking inf you're successfully connected to the server.
-		autoconnect_retryspeed 0.1 amount of seconds to wait before connecting to the server.
+	ConVars:
+		autoconnect_maxretrys (default: 1000)
+			The amount of retries before stopping completely   
+
+		autoconnect_checkspeed (default: 10)
+			The amount of time (in seconds) to wait before checking if the client successfully connected to the server. Increase this value if you're getting reconnected while you're joining the server.  
+
+		autoconnect_retryspeed (default: 0.1)
+			The amount of time (in seconds) to wait before retrying
+
+	how to install:
+		1. Decide which Script you want to use. autoconnect (with autoupdate) or autoconnect (without autoupdate).
+		2. Open the garrysmod folder
+		3. Copy all files/folders located in the selected autoconnect into the garrysmod folder. 
+		4. Start Garry's Mod and check if anything works.
+
+	Created by: Raphael(https://github.com/RaphaelIT7)
 ]]
 local lastip = ""
-
 local retrys = 0
 local retrydelay = 0 -- additional retry delay if youre too fast for the server.
 local maxretry = CreateClientConVar("autoconnect_maxretrys", "1000", true, false, "The amount of retries before stopping completely", 0, 2000000)

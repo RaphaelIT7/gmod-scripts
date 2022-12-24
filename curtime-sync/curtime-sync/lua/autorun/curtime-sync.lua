@@ -1,7 +1,9 @@
 --[[
-	This script solves the CurTime's lack of precision
+	This script solves CurTime's lack of precision
 
 	https://github.com/Facepunch/garrysmod-issues/issues/2502
+
+	Created by: Raphael(https://github.com/RaphaelIT7)
 ]]
 
 local SyncDelay = 30 -- in seconds

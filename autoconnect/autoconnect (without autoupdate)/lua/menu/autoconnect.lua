@@ -1,6 +1,6 @@
 --[[
 	autoconnect:
-		This script willl automaticly connect you to the server as soon as a slot is available.
+		This script will automatically connect you to the server as soon as a slot is available.
 
 	Commands:
 		autoconnect [ip] [password]

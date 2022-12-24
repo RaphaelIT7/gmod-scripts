@@ -18,4 +18,6 @@ The amount of time (in seconds) to wait before retrying
 1. Decide which Script you want to use. autoconnect (with autoupdate) or autoconnect (without autoupdate).
 2. Open the garrysmod folder
 3. Copy all files/folders located in the selected autoconnect into the garrysmod folder. 
-4. Start Garry's Mod and check if anything works.
+4. Start Garry's Mod and check if anything works.  
+
+NOTE: You need to install this script every time there was a Garry's Mod update, or you change the beta or validate your files.

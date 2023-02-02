@@ -26,7 +26,7 @@
 local noaddons, noworkshop = GetAddonStatus()
 if noaddons then return end
 
-
+local running = false
 local cancel = false
 local lastip = ""
 local retrys = 0
@@ -37,6 +37,7 @@ local retryspeed = CreateClientConVar("autoconnect_retryspeed", "0.1", true, fal
 function PingServer_Retry(address, bool)
 	if retrys >= maxretry:GetInt() then
 		print("[Autoconnect] Stopped joining the server because the retry limit has been reached. (can be changes with 'autoconnect_maxretrys " .. maxretry:GetFloat() + 50 .. "')")
+		running = false
 		return
 	end
 
@@ -139,6 +140,11 @@ concommand.Add("autoconnect", function(_, _, args)
 		retrys = 0
 		retrydelay = 0
 		failed_pings = 0
+		running = true
+		
+		if running then
+			cancel = true
+		end
 
 		hook.Add("Think", "Autoconnect_cancel", function()
 			if input.IsKeyDown(KEY_ESCAPE) or input.WasKeyPressed(KEY_ESCAPE) then

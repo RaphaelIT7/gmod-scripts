@@ -114,7 +114,7 @@ concommand.Add("autoconnect", function(_, _, args)
 	print("[Autoconnect] You're going to be connected to the following server: " .. ip)
 	print("[Autoconnect] Current retrys on fail: " .. maxretry:GetInt() .. " (can be changed with 'autoconnect_maxretrys " .. maxretry:GetInt() + 50 .. "')")
 	print("")
-	print("[Autoconnect] You can stop this script by holding ESC whiel its running.")
+	print("[Autoconnect] You can stop this script by holding ESC while its running.")
 	serverlist.PingServer(ip, function(ping, name, desc, map, players, maxplayers, botplayers, pass)
 		if !ping then
 			print("[Autoconnect] failed to get server information. Is the entered IP correct? IP: " .. ip)

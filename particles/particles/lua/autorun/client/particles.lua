@@ -52,11 +52,12 @@ local function UpdateBody(bodyID, dt)
 	particles_acc_y[bodyID] = 0
 end
 
+local Scale = MAXS / 500
 local DT = 0.02
 local MIN = 0.0001
 local MIN_SQR = MIN * MIN
 local allow_collision = false
-local Zoom = MAXS / 500
+local Zoom = 1
 local Next_Zoom = Zoom
 function Update(bodyCount)
 	local jbody, ibody, m1, p1x, p1y, m2, dx, dy, mag_sq, inv_mag, tmp_x, tmp_y
@@ -112,21 +113,6 @@ function Update(bodyCount)
     end
 end
 
-function draw.Circle( x, y, radius, seg )
-	local cir = {}
-
-	table.insert( cir, { x = x, y = y, u = 0.5, v = 0.5 } )
-	for i = 0, seg do
-		local a = math.rad( ( i / seg ) * -360 )
-		table.insert( cir, { x = x + math.sin( a ) * radius, y = y + math.cos( a ) * radius, u = math.sin( a ) / 2 + 0.5, v = math.cos( a ) / 2 + 0.5 } )
-	end
-
-	local a = math.rad( 0 ) -- This is needed for non absolute segment counts
-	table.insert( cir, { x = x + math.sin( a ) * radius, y = y + math.cos( a ) * radius, u = math.sin( a ) / 2 + 0.5, v = math.cos( a ) / 2 + 0.5 } )
-
-	surface.DrawPoly( cir )
-end
-
 local OldParticles = {}
 hook.Add("HUDPaint", "example", function()
 	Update(particles)
@@ -134,7 +120,7 @@ hook.Add("HUDPaint", "example", function()
 	local XOffset = ScrW() / 2
 	local YOffset = ScrH() / 2
 
-	Zoom = Lerp(0.05, Zoom, Next_Zoom)
+	Zoom = Lerp(0.05, Zoom, Next_Zoom * Scale)
 
 	surface.SetDrawColor(0, 0, 0, 255)
 	surface.DrawRect(0, 0, ScrW(), ScrH())

@@ -24,7 +24,7 @@ local function WriteSoundField(value, writeFunc, ...)
 	end
 end
 
-util.AddNetworkString("audioSystem_AudioSystem_PlaySound")
+util.AddNetworkString("AudioSystem_PlaySound")
 function AudioSystem.PlaySound(soundData) -- see cl_audiosystem.lua for documentation of the table.
 	if not istable(soundData) then
 		error("PlaySound: didn't get the table that it wants!")
@@ -34,7 +34,7 @@ function AudioSystem.PlaySound(soundData) -- see cl_audiosystem.lua for document
 		error("PlaySound: Missing soundPath field!")
 	end
 
-	net.Start("audioSystem_AudioSystem_PlaySound")
+	net.Start("AudioSystem_PlaySound")
 		WriteSoundField(soundData.soundPath, net.WriteString)
 		WriteSoundField(soundData.entity, WriteEntIndex)
 		WriteSoundField(soundData.soundLevel, net.WriteUInt, 14)
@@ -47,6 +47,8 @@ function AudioSystem.PlaySound(soundData) -- see cl_audiosystem.lua for document
 		WriteSoundField(soundData.maxDistance, net.WriteUInt, 16)
 		WriteSoundField(soundData.position, net.WriteVector)
 		WriteSoundField(soundData.modes, net.WriteString)
+		WriteSoundField(soundData.pan, net.WriteFloat)
+		WriteSoundField(soundData.playbackRate, net.WriteFloat)
 
 	if not soundData.sendToEntity then -- serverside only, its networked only to the player its being played od
 		net.Broadcast()
@@ -64,12 +66,12 @@ function AudioSystem.PlaySound(soundData) -- see cl_audiosystem.lua for document
 	})]]
 end
 
-util.AddNetworkString("audioSystem_AudioSystem_StopSound")
+util.AddNetworkString("AudioSystem_StopSound")
 function AudioSystem.StopSound(identifier, fadeOut, entity, sendToEntity)
 	fadeOut = fadeOut or 0
 
 	local isValid = IsValid(entity)
-	net.Start("audioSystem_AudioSystem_StopSound")
+	net.Start("AudioSystem_StopSound")
 		net.WriteBool(identifier == nil) -- if given nil as a identifier we will stop all sounds.
 		if identifier then
 			net.WriteString(identifier)
@@ -86,9 +88,9 @@ function AudioSystem.StopSound(identifier, fadeOut, entity, sendToEntity)
 	end
 end
 
-util.AddNetworkString("audioSystem_AudioSystem_FadeSound")
+util.AddNetworkString("AudioSystem_FadeSound")
 function AudioSystem.FadeSound(identifier, fadeTime, targetVolume) -- ToDo: Fix this function.
-	net.Start("audioSystem_AudioSystem_FadeSound")
+	net.Start("AudioSystem_FadeSound")
 		net.WriteString(identifier)
 		net.WriteFloat(fadeTime)
 		net.WriteFloat(targetVolume)

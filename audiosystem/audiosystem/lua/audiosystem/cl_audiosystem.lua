@@ -352,9 +352,12 @@ function AudioSystem.StopBackgroundMusic()
 end
 
 -- Returns the calculated time a channel is supposed to be at, it accounts for looping sounds
-function AudioSystem.CalculateTime(channel, tickCount)
+function AudioSystem.CalculateTime(channel, tickCount, looping)
 	local calculateTime = (engine.TickCount() - tickCount) * engine.TickInterval()
 	local fileLength = channel:GetLength()
+	if not looping then -- If we don't want looping, then we simply return the normal time without any more calculations.
+		return math.min(calculateTime, fileLength)
+	end
 
 	return calculateTime - (fileLength * math.floor(calculateTime / fileLength))
 end
@@ -482,7 +485,16 @@ local function UpdateChannelPosition(channel, channelData, localPlyPos)
 	local soundData = channelData.soundData
 	if newPos and soundData and soundData.minDistance and soundData.maxDistance then
 		local volume = CalculateFadeVolume(localPlyPos or AudioSystem.LocalPlayer:GetPos(), newPos, channelData.volume or soundData.volume, soundData)
+		--print(volume, channel:GetState())
 		channel:SetVolume(volume)
+		-- ToDo: Right now we don't do this as else stopsound won't have any effect. I'll add a convar later to allow anyone to adjust the volume for the entire audiosystem, until then we won't force the sounds upon users.
+		--[[if not soundData.noplay and channel:GetState() == GMOD_CHANNEL_STOPPED then -- BUG: Why can the sound randomy stop? I know that it isn't this system since in all cases where we stop it, we also delete it.
+			local time = channel:GetTime()
+			local length = channel:GetLength()
+			if not math.IsNearlyEqual(length, time, 1) and time < length then
+				channel:Play()
+			end
+		end]]
 		--print("3D", channel, channelData.ID, volume)
 	end
 end
@@ -614,7 +626,9 @@ function AudioSystem.PlaySound(soundData)
 		end
 
 		channel:EnableLooping(soundData.looping)
-		channel:SetTime(AudioSystem.CalculateTime(channel, soundData.startTick))
+		local calcTime = AudioSystem.CalculateTime(channel, soundData.startTick, soundData.looping)
+		channel:SetTime(calcTime)
+		local timeLeft = channel:GetLength() - calcTime
 
 		if soundData.identifier then
 			AudioSystem.SetChannelIdentifier(channel, soundData.identifier)
@@ -641,6 +655,10 @@ function AudioSystem.PlaySound(soundData)
 			channel:SetPan(soundData.pan)
 		end
 
+		if soundData.playbackRate then
+			channel:SetPlaybackRate(soundData.playbackRate)
+		end
+
 		if soundData.soundLevel and soundData.soundLevel ~= 0 then
 			soundData.minDistance = soundData.soundLevel ^ 1.25
 			soundData.maxDistance = soundData.soundLevel ^ 1.5
@@ -656,7 +674,7 @@ function AudioSystem.PlaySound(soundData)
 		end
 		UpdateChannelPosition(channel, channelData) -- Update the channel position so that when we play it, there won't be a audio bug for 1 frame where it would play from the world origin.
 
-		if not soundData.noplay then -- We call Play only here since some settings might change how it can be heard.
+		if not soundData.noplay and (timeLeft > 0 or soundData.looping) then -- We call Play only here since some settings might change how it can be heard.
 			channel:Play()
 		end
 
@@ -670,14 +688,14 @@ function AudioSystem.PlaySound(soundData)
 		end
 
 		if soundData.deleteWhenDone then
-			timer.Simple(channel:GetLength() + 0.2, function()
+			timer.Simple(timeLeft + 0.2, function()
 				if not IsValid(channel) then return end
 				AudioSystem.DestroyChannel(channel, 0)
 			end)
 		end
 
 		if soundData.fadeOut then
-			timer.Simple(channel:GetLength() - (soundData.fadeOut + 0.2), function() -- We add 0.2 just as a buffer to ensure that it'll go fine.
+			timer.Simple(timeLeft - (soundData.fadeOut + 0.2), function() -- We add 0.2 just as a buffer to ensure that it'll go fine.
 				if not IsValid(channel) then return end
 				AudioSystem.DestroyChannel(channel, soundData.fadeOut)
 			end)

@@ -384,7 +384,7 @@ end
 
 -- Returns the current background music time syncronized with all players.
 function AudioSystem.GetBackgroundMusicTime()
-	return AudioSystem.CalculateTime(AudioSystem.BackgroundChannel, GetGlobal2Int("AudioSystem:StartTimeBackgroundMusic"))
+	return AudioSystem.CalculateTime(AudioSystem.BackgroundChannel, GetGlobal2Int("AudioSystem:StartTimeBackgroundMusic"), true)
 end
 
 local lastCreation = 0 -- Doesn't need autorefresh so were fine.
@@ -413,7 +413,7 @@ function AudioSystem.PlayBackgroundMusic(fileName)
 		channel:SetVolume(0)
 		channel:Play()
 		channel:EnableLooping(true)
-		AudioSystem.BackgroundChannel:SetTime(AudioSystem.GetBackgroundMusicTime())
+		channel:SetTime(AudioSystem.GetBackgroundMusicTime())
 		AudioSystem.FadeTo(channel, 5, AudioSystem.GetBackgroundMusicVolume())
 	end)
 end

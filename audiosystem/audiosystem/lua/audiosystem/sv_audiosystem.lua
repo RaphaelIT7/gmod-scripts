@@ -24,6 +24,12 @@ local function WriteSoundField(value, writeFunc, ...)
 	end
 end
 
+local function WritePulseEffect(table)
+	WriteSoundField(table.entity, WriteEntIndex)
+	WriteSoundField(table.entityClass, net.WriteString)
+	WriteSoundField(table.frequency, net.ReadUInt, 16)
+end
+
 util.AddNetworkString("AudioSystem_PlaySound")
 function AudioSystem.PlaySound(soundData) -- see cl_audiosystem.lua for documentation of the table.
 	if not istable(soundData) then
@@ -42,6 +48,7 @@ function AudioSystem.PlaySound(soundData) -- see cl_audiosystem.lua for document
 
 	net.Start("AudioSystem_PlaySound")
 		WriteSoundField(soundData.soundPath, net.WriteString)
+		WriteSoundField(soundData.fallbackSoundPath, net.WriteString)
 		WriteSoundField(soundData.entity, WriteEntIndex)
 		WriteSoundField(soundData.soundLevel, net.WriteUInt, 14)
 		WriteSoundField(soundData.volume, net.WriteFloat)
@@ -60,10 +67,13 @@ function AudioSystem.PlaySound(soundData) -- see cl_audiosystem.lua for document
 		WriteSoundField(soundData.deleteWhenDone, net.WriteBool)
 		WriteSoundField(soundData.fadeIn, net.WriteFloat)
 		WriteSoundField(soundData.fadeOut, net.WriteFloat)
+		WriteSoundField(soundData.fadeOutStart, net.WriteFloat)
 		WriteSoundField(soundData.forceMono, net.WriteBool)
 		WriteSoundField(soundData.forceSterio, net.WriteBool)
 		WriteSoundField(soundData.noWorldSpace, net.WriteBool)
 		WriteSoundField(soundData.dynamicPan, net.WriteBool)
+		WriteSoundField(soundData.boundConVar, net.WriteString)
+		WriteSoundField(soundData.pulseEffect, WritePulseEffect)
 		-- NOTE: We don't network the field noplay since we expect networked sounds to always play instantly based on how we currently use it.
 
 	if not soundData.sendToEntity then -- serverside only, its networked only to the player its being played od

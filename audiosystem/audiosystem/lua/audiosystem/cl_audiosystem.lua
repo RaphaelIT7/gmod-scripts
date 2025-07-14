@@ -284,8 +284,10 @@ function AudioSystem.DestroyChannel(channel, fadeOutTime, callback)
 				if !IsValid(channel) or vol <= 0 then
 					timer.Remove(timerName)
 					channelData.volume = nil
-					channel:Stop()
-					channel:__gc()
+					if IsValid(channel) then
+						channel:Stop()
+						channel:__gc()
+					end
 					AudioSystem.CheckChannels()
 					AudioSystem.Channels[channel] = nil
 
@@ -516,7 +518,7 @@ local function UpdateChannelPosition(channel, channelData, localPlyPos)
 
 	if newPos and soundData.minDistance and soundData.maxDistance then
 		local volume = CalculateFadeVolume(localPlyPos or AudioSystem.LocalPlayer:GetPos(), newPos, channelData.volume or soundData.volume, soundData)
-
+		
 		if soundData.dynamicPan then
 			channel:SetPan(CalculatePan(AudioSystem.LocalPlayer, newPos))
 		end
@@ -557,6 +559,85 @@ end
 ]]
 hook.Add("PreRender", "AudioSystem:AudioSystem", AudioSystem.Think)
 
+local function RenderPulseEffect(entity, pulse, bumpDelay)
+	local originalScale = entity:GetModelScale()
+	if not pulse then
+		entity._LastPulseScale = Lerp(FrameTime(), (entity._LastPulseScale or originalScale), 1)
+		--print(entity._LastPulseScale)
+		entity:SetModelScale(entity._LastPulseScale, 0)
+	else
+		entity:SetModelScale(originalScale * 1.1, 0)
+		entity._LastPulseScale = entity:GetModelScale()
+	end
+
+	local r, g, b = 255, 0, 0
+	render.SetColorModulation(r / 255, g / 255, b / 255)
+	render.SetBlend(((entity._LastPulseScale - 1) * 10) - (math.Clamp(bumpDelay - CurTime(), 1, 0)) * 255)
+	entity:DrawModel()
+	render.SetBlend(1)
+	entity:SetModelScale(originalScale, 0)
+end
+
+function AudioSystem.EffectThink() -- A WIP effect that can be used at a later point.
+	for channel, channelData in pairs(AudioSystem.Channels) do
+		local soundData = channelData.soundData
+		if not soundData then continue end
+
+		local pulseEffect = soundData.pulseEffect
+		if pulseEffect then
+			local shouldPulse = false
+			local sampleSize = 10
+			local threshold = 0.1
+			local minDelay = 0.2
+			local offset = 25
+			local fft = {}
+			//debug.setmetatable(fft, meta)
+			channel:FFT(fft, FFT_4096)
+			if #fft == 0 then continue end
+			local sum = 0
+			local sumCount = 0
+			for i=offset, offset + sampleSize do
+				sum = sum + fft[i]
+				sumCount = sumCount + 1
+			end
+			sum = sum / sumCount
+			channelData.PreviousPulseSum = Lerp(0.003, channelData.PreviousPulseSum or 0, sum)
+
+			if #fft == 0 then continue end
+			cam.Start2D()
+			surface.SetDrawColor(0, 0, 0, 255)
+			for i=offset, offset + sampleSize do
+				surface.DrawRect(0, 2 * i, fft[i] * 8192, 10)
+			end
+			cam.End2D()
+
+			channelData.bumpDelay = channelData.bumpDelay or CurTime()
+			if channelData.bumpDelay < CurTime() and sum > channelData.PreviousPulseSum then
+				channelData.PreviousPulseSum = sum
+				channelData.bumpDelay = CurTime() + minDelay
+				shouldPulse = true
+			end
+
+			local pulseEnt = pulseEffect.entity and Entity(pulseEffect.entity) or nil
+			if IsValid(pulseEnt) then
+				RenderPulseEffect(pulseEnt, shouldPulse, channelData.bumpDelay)
+			end
+
+			if pulseEffect.entityClass then
+				for _, ent in ipairs(ents.FindByClass(pulseEffect.entityClass)) do
+					RenderPulseEffect(ent, shouldPulse, channelData.bumpDelay)
+				end
+			end
+		end
+	end
+end
+
+hook.Add("PostDrawOpaqueRenderables", "AudioSystem:AudioSystem", function(_, drawingSkybox, drawing3D)
+	if drawing3D or drawingSkybox then return end
+
+	--AudioSystem.EffectThink()
+end)
+
 --[[
 	The soundData table contains all values to create and configure a channel.
 	Required fields:
@@ -579,14 +660,22 @@ hook.Add("PreRender", "AudioSystem:AudioSystem", AudioSystem.Think)
 		number pan - The sound pan - See https://wiki.facepunch.com/gmod/IGModAudioChannel:SetPan
 		number playbackRate - The sound playback rate.
 		boolean noplay - Won't automatically play the sound
-		string group - If set, a hook is called allowing you to add a hook that is executed when a sound is played like this: hook.Add("AudioSystem:AudioSystem:PlaySound:ExampleGroup", "Example", function(soundData, channel))
+		string group - If set, a hook is called allowing you to add a hook that is executed when a sound is played like this: hook.Add("AudioSystem:PlaySound:ExampleGroup", "Example", function(soundData, channel))
 		boolean deleteWhenDone - If true, the channel is deleted once the sound finished playing (will ignore looping flag and still stop it).
 		number fadeIn - How many seconds it takes for the song to fade in at the start of it.
 		number fadeOut - How many seconds before the ending it should start to fade out, and when it faded out the channel is destroyed.
+		number fadeOutStart - How many seconds after the sound start it should begin to fade out. Use negative number to use a time based off the end of the sound instead of the start.
 		boolean forceMono - Forces the sound to play as mono. Perferably use forceSterio since it won't butcher the sound quality.
 		boolean forceSterio - Forces the sound to play as sterio. This doesn't really force it to be sterio but rather it removes the mono or 3d flag if they have been set.
 		boolean noWorldSpace - If set it will use the entities EyePos instead of falling back to using it's WorldSpaceCenter position.
 		boolean dynamicPan - If set it will calculate the pan for the channel giving the sound a 3D effect.
+		string fallbackSoundPath - The fallback sound when the bound ConVar is disabled.
+		string boundConVar - A ConVar the sound is bound to, when the ConVar is false then it will instead play the set fallbackSoundPath
+
+		table pulseEffect - A table for the pulse effect. NOTE: This is still WIP and should not be used.
+		-> Entity entity - A entity that should pulse
+		-> string entityClass - The class of which all entities should pulse like sc_gascan
+		-> number frequency - The sound frequency that should be checked for - currently unused.
 
 	Notes:
 		When the entity is set to the world, the sound is played as mono and NOT 3d!
@@ -600,7 +689,15 @@ hook.Add("PreRender", "AudioSystem:AudioSystem", AudioSystem.Think)
 		You can combine forceSterio and dynamicPan to give sounds a fake 3D effect while keeping the quality of them being in sterio/using multiple channels instead of the normal 3D that forces them into mono.
 ]]
 function AudioSystem.PlaySound(soundData)
-	soundData.identifier = soundData.identifier or soundData.soundPath
+	local soundPath = soundData.soundPath
+	if soundData.boundConVar and soundData.fallbackSoundPath then
+		local convar = GetConVar(soundData.boundConVar)
+		if not convar:GetBool() then
+			soundPath = soundData.fallbackSoundPath
+		end
+	end
+
+	soundData.identifier = soundData.identifier or soundPath
 	soundData.startTick = soundData.startTick or engine.TickCount()
 	--soundData.entity = soundData.entity or game.GetWorld()
 	soundData.volume = soundData.volume or 1
@@ -647,7 +744,7 @@ function AudioSystem.PlaySound(soundData)
 		useMode = ""
 	end
 
-	AudioSystem.CreateChannel(soundData.soundPath, AppendMode(AppendMode(useMode, soundData.modes), "noplay"), function(channel, channelData)
+	AudioSystem.CreateChannel(soundPath, AppendMode(AppendMode(useMode, soundData.modes), "noplay"), function(channel, channelData)
 		local soundData = AudioSystem.CreatingChannels[soundData.identifier] or soundData -- Update in case it was updated in the few frames we had originally made our call.
 		if soundData.DESTROYCHANNEL then
 			channel:SetVolume(0)
@@ -667,7 +764,8 @@ function AudioSystem.PlaySound(soundData)
 		channel:EnableLooping(soundData.looping)
 		local calcTime = AudioSystem.CalculateTime(channel, soundData.startTick, soundData.looping)
 		channel:SetTime(calcTime)
-		local timeLeft = channel:GetLength() - calcTime
+		local totalLength = channel:GetLength()
+		local timeLeft = totalLength - calcTime
 
 		if soundData.identifier then
 			AudioSystem.SetChannelIdentifier(channel, soundData.identifier)
@@ -722,18 +820,29 @@ function AudioSystem.PlaySound(soundData)
 		end
 
 		if soundData.group then
-			hook.Run("AudioSystem:AudioSystem:PlaySound:" .. soundData.group, soundData, channel)
+			hook.Run("AudioSystem:PlaySound:" .. soundData.group, soundData, channel)
 		end
 
 		if soundData.deleteWhenDone then
-			timer.Simple(timeLeft + 0.2, function()
+			timer.Simple(timeLeft + 0.1, function()
 				if not IsValid(channel) then return end
 				AudioSystem.DestroyChannel(channel, 0)
 			end)
 		end
 
 		if soundData.fadeOut then
-			timer.Simple(timeLeft - (soundData.fadeOut + 0.2), function() -- We add 0.2 just as a buffer to ensure that it'll go fine.
+			local baseTime = soundData.fadeOut + 0.1 -- We add 0.1 just as a buffer to ensure that it'll go fine.
+			local time = timeLeft - baseTime
+			local timeOffset = soundData.fadeOutStart or 0
+			if timeOffset ~= 0 then
+				if timeOffset > 0 then
+					time = timeOffset - calcTime
+				else
+					time = totalLength + timeOffset
+				end
+			end
+
+			timer.Simple(time, function()
 				if not IsValid(channel) then return end
 				AudioSystem.DestroyChannel(channel, soundData.fadeOut)
 			end)
@@ -815,9 +924,18 @@ local function ReadSoundField(readFunc, ...)
 	return nil
 end
 
-net.Receive("AudioSystem_PlaySound", function()
+local function ReadPulseEffect()
+	return {
+		entity = ReadSoundField(net.ReadUInt, MAX_EDICT_BITS),
+		entityClass = ReadSoundField(net.ReadString),
+		frequency = ReadSoundField(net.ReadUInt, 16),
+	}
+end
+
+net.Receive("slashCo_AudioSystem_PlaySound", function()
 	local soundData = {
 		soundPath = ReadSoundField(net.ReadString),
+		fallbackSoundPath = ReadSoundField(net.ReadString),
 		entity = ReadSoundField(net.ReadUInt, MAX_EDICT_BITS),
 		soundLevel = ReadSoundField(net.ReadUInt, 14),
 		volume = ReadSoundField(net.ReadFloat),
@@ -836,16 +954,19 @@ net.Receive("AudioSystem_PlaySound", function()
 		deleteWhenDone = ReadSoundField(net.ReadBool),
 		fadeIn = ReadSoundField(net.ReadFloat),
 		fadeOut = ReadSoundField(net.ReadFloat),
+		fadeOutStart = ReadSoundField(net.ReadFloat),
 		forceMono = ReadSoundField(net.ReadBool),
 		forceSterio = ReadSoundField(net.ReadBool),
 		noWorldSpace = ReadSoundField(net.ReadBool),
 		dynamicPan = ReadSoundField(net.ReadBool),
+		boundConVar = ReadSoundField(net.ReadString),
+		pulseEffect = ReadSoundField(ReadPulseEffect),
 	}
 
 	-- NOTE: We intentionally do this only for sounds played by the server since they won't possibly move the channel independantly.
 	-- While clientside, the channel could be moved after PlaySound was called so if we forced it into mono we could break things.
 	if soundData.entity ~= nil and soundData.entity == AudioSystem.LocalEntIndex then
-		soundData.forceMono = true -- We are playing the sound on the local player, so we switch it to mono for hopefully better quality & for no 3D audio bugs since the audio source is exacty at the ear position.
+		soundData.forceSterio = true -- We are playing the sound on the local player, so we switch it to sterio for hopefully better quality & for no 3D audio bugs since the audio source is exacty at the ear position.
 	end
 
 	AudioSystem.PlaySound(soundData)

@@ -1,4 +1,5 @@
 AudioSystem = AudioSystem or {}
+AudioSystem.RegisteredSounds = AudioSystem.RegisteredSounds or {}
 
 --[[
 	The Background music is networked & syncronized.
@@ -21,11 +22,11 @@ function AudioSystem.ToSound(fileName)
 end
 
 function AudioSystem.ShouldPlayBackgroundMusic()
-	return GetGlobal2Bool("AudioSystem:ShouldPlayBackgroundMusic", false)
+	return GetGlobal2Bool("SlashCo:ShouldPlayBackgroundMusic", false)
 end
 
 function AudioSystem.EnableBackgroundMusic()
-	SetGlobal2Bool("AudioSystem:ShouldPlayBackgroundMusic", true)
+	SetGlobal2Bool("SlashCo:ShouldPlayBackgroundMusic", true)
 end
 
 function AudioSystem.EnableBackgroundMusic(forced)
@@ -34,18 +35,18 @@ function AudioSystem.EnableBackgroundMusic(forced)
 	end
 
 	if AudioSystem.ForcedDisable then return end
-	SetGlobal2Bool("AudioSystem:ShouldPlayBackgroundMusic", true)
+	SetGlobal2Bool("SlashCo:ShouldPlayBackgroundMusic", true)
 end
 
 function AudioSystem.DisableBackgroundMusic(forced)
-	SetGlobal2Bool("AudioSystem:ShouldPlayBackgroundMusic", false)
+	SetGlobal2Bool("SlashCo:ShouldPlayBackgroundMusic", false)
 	AudioSystem.ForcedDisable = forced or false
 end
 
 function AudioSystem.SetBackgroundMusic(soundFile, volume)
-	SetGlobal2String("AudioSystem:BackgroundMusic", soundFile)
-	SetGlobal2Float("AudioSystem:BackgroundMusicVolume", volume or 1)
-	SetGlobal2Int("AudioSystem:StartTimeBackgroundMusic", engine.TickCount()) -- Timestamp to syncronize the music for everyone
+	SetGlobal2String("SlashCo:BackgroundMusic", soundFile)
+	SetGlobal2Float("SlashCo:BackgroundMusicVolume", volume or 1)
+	SetGlobal2Int("SlashCo:StartTimeBackgroundMusic", engine.TickCount()) -- Timestamp to syncronize the music for everyone
 
 	if DisableSoundScapes then
 		--DisableSoundScapes() -- disable sound scapes.
@@ -53,15 +54,51 @@ function AudioSystem.SetBackgroundMusic(soundFile, volume)
 end
 
 function AudioSystem.SetBackgroundMusicVolume(volume)
-	SetGlobal2Float("AudioSystem:BackgroundMusicVolume", volume or 1)
+	SetGlobal2Float("SlashCo:BackgroundMusicVolume", volume or 1)
 end
 
 function AudioSystem.GetBackgroundMusic(fallBack)
-	return GetGlobal2String("AudioSystem:BackgroundMusic", fallBack or "")
+	return GetGlobal2String("SlashCo:BackgroundMusic", fallBack or "")
 end
 
 function AudioSystem.GetBackgroundMusicVolume(fallBack)
-	return GetGlobal2Float("AudioSystem:BackgroundMusicVolume", fallBack or 1)
+	return GetGlobal2Float("SlashCo:BackgroundMusicVolume", fallBack or 1)
+end
+
+function AudioSystem.RegisterSound(registerName, soundTable)
+	AudioSystem.RegisteredSounds[registerName] = soundTable
+end
+
+-- Creates a copy of the given table.
+-- We don't care about any userdata since our soundTable should have none at all.
+local function CopyTable(input, references)
+	local output = {}
+	references = references or {} -- to prevent loops
+	if references[input] then
+		print("CopyTable was called with looping references!")
+		return output
+	end
+	references[input] = true
+
+	for key, value in pairs(input) do
+		if type(value) == "table" then
+			output[key] = CopyTable(value, references)
+		else
+			output[key] = value
+		end
+	end
+
+	return output
+end
+
+-- Returns a copy of the soundTable that can freely be modified and used, or returns nil if no sound was registered with the given name
+function AudioSystem.GetRegisteredSound(registerName)
+	local soundTable = AudioSystem.RegisteredSounds[registerName]
+	if not soundTable then
+		return nil -- There is no song registered with this name
+	end
+
+	return CopyTable(soundTable)
 end
 
 function AudioSystem.PrecacheSound(soundFile)

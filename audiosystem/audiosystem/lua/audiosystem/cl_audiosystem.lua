@@ -1,14 +1,18 @@
 AudioSystem.Channels = AudioSystem.Channels or {} -- All IGModAudioChannel instances, use pairs to iterate as it will have holes.
 AudioSystem.CreatingChannels = AudioSystem.CreatingChannels or {} -- Sounds that are currently being created.
 AudioSystem.PrecacheSounds = AudioSystem.PrecacheSounds or {}
+AudioSystem.DeltaSoundCache = AudioSystem.DeltaSoundCache or {}
 AudioSystem.BackgroundChannel = AudioSystem.BackgroundChannel or nil
 AudioSystem.ChannelIDs = AudioSystem.ChannelIDs or 0 -- Incremental number to assign channel id's
 AudioSystem.UpdateFrequency = 0.05 -- How often timers execute to update the volume when fading it to a new value.
+
+local ErrorList = {} -- A table containing all the files we failed to open, if the file is in this list and we fail loading again, then we won't throw another error.
 
 -- So that we don't depend on the GameData table as this system is meant to also work as a standalone library.
 AudioSystem.IsSinglePlayer = AudioSystem.IsSinglePlayer or game.SinglePlayer()
 AudioSystem.LocalPlayer = AudioSystem.LocalPlayer or nil
 AudioSystem.LocalEntIndex = AudioSystem.LocalEntIndex or -1
+AudioSystem.ValidLocalPlayer = IsValid(AudioSystem.LocalPlayer)
 
 --[[local enable_backgroundmusic = CreateClientConVar("enable_backgroundmusic", "1", true, false)
 
@@ -69,11 +73,14 @@ function AudioSystem.CreateChannel(soundFile, mode, callback, errorCallback)
 	local soundFunc = isURL and sound.PlayURL or sound.PlayFile
 	soundFunc(soundFile, mode, function(channel, errCode, errStr)
 		if not IsValid(channel) then
-			if not errorCallback then
+			if errorCallback then
 				errorCallback(errCode, errStr)
 			end
 
-			error("[AudioSystem] Failed to create audio channel! (" .. errCode .. ", " .. errStr .. "," .. soundFile .. ")\n")
+			if not ErrorList[soundFile] then
+				ErrorList[soundFile] = true
+				error("[AudioSystem] Failed to create audio channel! (" .. errCode .. ", " .. errStr .. ", " .. soundFile .. ")\n")
+			end
 			return
 		end
 
@@ -94,7 +101,7 @@ function AudioSystem.SetChannelIdentifier(channel, identifier)
 	AudioSystem.Channels[channel].identifier = identifier
 end
 
-function AudioSystem.GetChannelByIdentifier(identifier)
+function AudioSystem.GetChannelByIdentifier(identifier, entIndex)
 	for channel, channelData in pairs(AudioSystem.Channels) do
 		if channelData.identifier == identifier and channelData.State == ChannelStates.OK then
 			return channel
@@ -240,6 +247,11 @@ local function CalculateFadeVolume(playerPos, channelPos, initialVolume, soundDa
 	return initialVolume
 end
 
+local fallbackPosition = Vector(0, 0, 0)
+local function GetLocalPlayerPosition() -- We can get net messages received before the local player is valid, so we fallback to the world origin until them.
+	return AudioSystem.ValidLocalPlayer and AudioSystem.LocalPlayer:GetPos() or fallbackPosition
+end
+
 -- Helper function to wrap around CalculateFadeVolume
 local function CalculateChannelVolume(channel, targetVol)
 	local channelData = AudioSystem.Channels[channel]
@@ -248,7 +260,7 @@ local function CalculateChannelVolume(channel, targetVol)
 		if channelData then
 			local soundData = channelData.soundData
 			if soundData then
-				return CalculateFadeVolume(AudioSystem.LocalPlayer:GetPos(), channelData.pos or channel:GetPos(), targetVol, soundData)
+				return CalculateFadeVolume(GetLocalPlayerPosition(), channelData.pos or channel:GetPos(), targetVol, soundData)
 			end
 		end
 	end
@@ -328,6 +340,35 @@ end
 
 	NOTE: When called multiple times, the callback will only be called when the fade actually finishes, when its overwritten it won't be called.
 ]]
+local function UpdateFadeToVolume(targetVol, vol, volumeIncrement, lowerVol, channelData, callback, timerName, channel)
+	local reachedTarget = false
+	if lowerVol then
+		reachedTarget = targetVol >= vol
+	else
+		reachedTarget = vol >= targetVol
+	end
+
+	if !IsValid(channel) or reachedTarget then
+		channelData.volume = nil
+		timer.Remove(timerName)
+		if callback then
+			callback(channel, channelData)
+		end
+		return targetVol
+	end
+
+	if lowerVol then
+		vol = vol - volumeIncrement
+	else
+		vol = vol + volumeIncrement
+	end
+
+	local channelVolume = CalculateChannelVolume(channel, vol)
+	channelData.volume = channelVolume
+	channel:SetVolume(AudioSystem.EnsureValidVolume(channelVolume))
+	return vol
+end
+
 function AudioSystem.FadeTo(channel, fadeTime, targetVol, callback)
 	targetVol = targetVol or 1
 	fadeTime = fadeTime or 1
@@ -340,32 +381,11 @@ function AudioSystem.FadeTo(channel, fadeTime, targetVol, callback)
 	local volumeIncrement = math.abs(targetVol - vol) / math.ceil(fadeTime / updateFreq)
 	local channelData = AudioSystem.Channels[channel]
 	timer.Create(timerName, updateFreq, 0, function() -- Let the sound fade away
-		local reachedTarget = false
-		if lowerVol then
-			reachedTarget = targetVol >= vol
-		else
-			reachedTarget = vol >= targetVol
-		end
-
-		if !IsValid(channel) or reachedTarget then
-			channelData.volume = nil
-			timer.Remove(timerName)
-			if callback then
-				callback(channel, channelData)
-			end
-			return
-		end
-
-		if lowerVol then
-			vol = vol - volumeIncrement
-		else
-			vol = vol + volumeIncrement
-		end
-
-		local channelVolume = CalculateChannelVolume(channel, vol)
-		channelData.volume = channelVolume
-		channel:SetVolume(AudioSystem.EnsureValidVolume(channelVolume))
+		vol = UpdateFadeToVolume(targetVol, vol, volumeIncrement, lowerVol, channelData, callback, timerName, channel)
 	end)
+
+	-- Do one update outside the timer, since if you call this function every frame for some reason, the timer may never execute.
+	vol = UpdateFadeToVolume(targetVol, vol, volumeIncrement, lowerVol, channelData, callback, timerName, channel)
 end
 
 function AudioSystem.StopBackgroundMusic()
@@ -416,7 +436,7 @@ function AudioSystem.PlayBackgroundMusic(fileName)
 		channel:Play()
 		channel:EnableLooping(true)
 		channel:SetTime(AudioSystem.GetBackgroundMusicTime())
-		AudioSystem.FadeTo(channel, 5, AudioSystem.GetBackgroundMusicVolume())
+		AudioSystem.FadeTo(channel, 3, AudioSystem.GetBackgroundMusicVolume())
 	end)
 end
 
@@ -425,7 +445,7 @@ local function OnBackgroundMusicChange(ent, name, old, new)
 	AudioSystem.PlayBackgroundMusic(new)
 end
 
--- This is a NW2 Proxy function.
+-- This is another NW2 Proxy function.
 local function OnBackgroundMusicStateChange(ent, name, old, new)
 	if not new then
 		if IsValid(AudioSystem.BackgroundChannel) then
@@ -439,7 +459,7 @@ end
 -- Did you know? This was one too >:3
 local function OnBackgroundMusicVolumeChange(ent, name, old, new)
 	if IsValid(AudioSystem.BackgroundChannel) then
-		AudioSystem.FadeTo(AudioSystem.BackgroundChannel, 5, new)
+		AudioSystem.FadeTo(AudioSystem.BackgroundChannel, 3, new)
 	end
 end
 
@@ -448,6 +468,7 @@ function AudioSystem.Init()
 
 	AudioSystem.LocalPlayer = LocalPlayer()
 	AudioSystem.LocalEntIndex = AudioSystem.LocalPlayer:EntIndex()
+	AudioSystem.ValidLocalPlayer = IsValid(AudioSystem.LocalPlayer)
 
 	--[[
 		Setting up the proxies in case the background music changes.
@@ -486,6 +507,10 @@ local function UpdateBackgroundMusic()
 end
 
 function CalculatePan(ply, channelPos)
+	if not AudioSystem.ValidLocalPlayer then
+		return 0
+	end
+
 	local forward = ply:GetAimVector()
 	local right = forward:Angle():Right()
 	local toSound = (channelPos - ply:GetPos()):GetNormalized()
@@ -517,7 +542,7 @@ local function UpdateChannelPosition(channel, channelData, localPlyPos)
 	end
 
 	if newPos and soundData.minDistance and soundData.maxDistance then
-		local volume = CalculateFadeVolume(localPlyPos or AudioSystem.LocalPlayer:GetPos(), newPos, channelData.volume or soundData.volume, soundData)
+		local volume = CalculateFadeVolume(localPlyPos or GetLocalPlayerPosition(), newPos, channelData.volume or soundData.volume, soundData)
 		
 		if soundData.dynamicPan then
 			channel:SetPan(CalculatePan(AudioSystem.LocalPlayer, newPos))
@@ -537,7 +562,7 @@ local function UpdateChannelPosition(channel, channelData, localPlyPos)
 end
 
 local function UpdateChannelPositions()
-	local localPlyPos = AudioSystem.LocalPlayer:GetPos()
+	local localPlyPos = GetLocalPlayerPosition()
 	for channel, channelData in pairs(AudioSystem.Channels) do
 		--[[
 			Why don't we remove the channel if the parent is gone?
@@ -660,7 +685,7 @@ end)
 		number pan - The sound pan - See https://wiki.facepunch.com/gmod/IGModAudioChannel:SetPan
 		number playbackRate - The sound playback rate.
 		boolean noplay - Won't automatically play the sound
-		string group - If set, a hook is called allowing you to add a hook that is executed when a sound is played like this: hook.Add("AudioSystem:PlaySound:ExampleGroup", "Example", function(soundData, channel))
+		string group - If set, a hook is called allowing you to add a hook that is executed when a sound is played like this: hook.Add("AudioSystem:AudioSystem:PlaySound:ExampleGroup", "Example", function(soundData, channel))
 		boolean deleteWhenDone - If true, the channel is deleted once the sound finished playing (will ignore looping flag and still stop it).
 		number fadeIn - How many seconds it takes for the song to fade in at the start of it.
 		number fadeOut - How many seconds before the ending it should start to fade out, and when it faded out the channel is destroyed.
@@ -671,11 +696,16 @@ end)
 		boolean dynamicPan - If set it will calculate the pan for the channel giving the sound a 3D effect.
 		string fallbackSoundPath - The fallback sound when the bound ConVar is disabled.
 		string boundConVar - A ConVar the sound is bound to, when the ConVar is false then it will instead play the set fallbackSoundPath
+		boolean disableUniqueToEntity - If set, the entity index is NOT added to the identifier allowing the sound to be played only ONCE and NOT by multiple entities.
+		boolean disableAutoRemove - If set, the channel won't be removed after the entity of the channel was removed.
 
 		table pulseEffect - A table for the pulse effect. NOTE: This is still WIP and should not be used.
 		-> Entity entity - A entity that should pulse
 		-> string entityClass - The class of which all entities should pulse like sc_gascan
 		-> number frequency - The sound frequency that should be checked for - currently unused.
+
+	Internal fields:
+		boolean isServerside - Set if the sound was sent to us by the server.
 
 	Notes:
 		When the entity is set to the world, the sound is played as mono and NOT 3d!
@@ -704,14 +734,18 @@ function AudioSystem.PlaySound(soundData)
 	soundData.looping = soundData.looping or false
 	soundData.modes = soundData.modes or ""
 
-	AudioSystem.StopSound(soundData.identifier, 0.5)
-
 	local entIndex = 0
 	if isnumber(soundData.entity) then
 		entIndex = soundData.entity
 	elseif IsValid(soundData.entity) then
 		entIndex = soundData.entity:EntIndex() -- ToDo: Should we also support clientside entities? Probably.
 	end
+
+	if not soundData.disableUniqueToEntity then
+		soundData.identifier = soundData.identifier .. entIndex
+	end
+
+	AudioSystem.StopSound(soundData.identifier, 0.5)
 
 	local existingCreationData = AudioSystem.CreatingChannels[soundData.identifier]
 	local isAlreadyInCreation = existingCreationData ~= nil
@@ -819,8 +853,8 @@ function AudioSystem.PlaySound(soundData)
 			soundData.callback(channel)
 		end
 
-		if soundData.group then
-			hook.Run("AudioSystem:PlaySound:" .. soundData.group, soundData, channel)
+		if soundData.group then -- This will be useful later when adding perks that modify the sound of things
+			hook.Run("AudioSystem:AudioSystem:PlaySound:" .. soundData.group, soundData, channel)
 		end
 
 		if soundData.deleteWhenDone then
@@ -867,8 +901,8 @@ function AudioSystem.GetEntityChannels(entity)
 	end
 
 	local results = {}
-	for channel, entTbl in pairs(AudioSystem.Channels) do
-		if entTbl.entIndex ~= entIndex then continue end
+	for channel, channelData in pairs(AudioSystem.Channels) do
+		if channelData.entIndex ~= entIndex then continue end
 		
 		table.insert(results, channel)
 	end
@@ -883,6 +917,10 @@ end
 ]]
 function AudioSystem.StopSound(identifier, fadeOut, entIndex)
 	fadeOut = fadeOut or 1
+
+	if not isnumber(entIndex) and IsValid(entIndex) then
+		entIndex = entIndex:EntIndex()
+	end
 
 	if not identifier then -- No identifier? then we want to stop all sounds.
 		if not entIndex then -- No entitiy? Then we want to stop all sounds globally.
@@ -899,13 +937,14 @@ function AudioSystem.StopSound(identifier, fadeOut, entIndex)
 		return
 	end
 
-	local creationSounData = AudioSystem.CreatingChannels[identifier]
+	-- We use or and do identifier .. entIndex since if a sound has makeUniqueToEntity set, it will append the EntIndex to our identifier
+	local creationSounData = AudioSystem.CreatingChannels[identifier] or AudioSystem.CreatingChannels[identifier .. (entIndex or "")]
 	if creationSounData then -- The channel wasn't created yet, so we cannot stop it. Instead we'll set a flag.
 		creationSounData.DESTROYCHANNEL = true
 		return
 	end
 
-	local channel = AudioSystem.GetChannelByIdentifier(identifier)
+	local channel = AudioSystem.GetChannelByIdentifier(identifier) or AudioSystem.GetChannelByIdentifier(identifier .. (entIndex or ""))
 	if not channel then return end
 
 	AudioSystem.DestroyChannel(channel, fadeOut)
@@ -932,7 +971,26 @@ local function ReadPulseEffect()
 	}
 end
 
-net.Receive("slashCo_AudioSystem_PlaySound", function()
+local deltaMerge
+local function DeltaMerge(deltaTable, baseTable)
+	for key, val in pairs(baseTable) do
+		local deltaTableVal = deltaTable[key]
+		if deltaTableVal then
+			if istable(deltaTableVal) then
+				deltaMerge(deltaTableVal, baseTable[key])
+			else
+				baseTable[key] = val -- We inherit from the current deltaTable so that our baseTable is always up to date containing the same data from the last request
+			end
+			continue -- We got nothing to change :3
+		end
+
+		deltaTable[key] = val
+	end
+end
+deltaMerge = DeltaMerge
+
+net.Receive("AudioSystem_PlaySound", function()
+	local isDelta = net.ReadBool()
 	local soundData = {
 		soundPath = ReadSoundField(net.ReadString),
 		fallbackSoundPath = ReadSoundField(net.ReadString),
@@ -961,13 +1019,34 @@ net.Receive("slashCo_AudioSystem_PlaySound", function()
 		dynamicPan = ReadSoundField(net.ReadBool),
 		boundConVar = ReadSoundField(net.ReadString),
 		pulseEffect = ReadSoundField(ReadPulseEffect),
+		disableUniqueToEntity = ReadSoundField(net.ReadBool),
+		disableAutoRemove = ReadSoundField(net.ReadBool),
 	}
+
+	local identifier = soundData.identifier or soundData.soundPath
+	if isDelta then
+		local baseTable = AudioSystem.DeltaSoundCache[identifier]
+		if baseTable then
+			DeltaMerge(soundData, baseTable)
+		else
+			-- Uh oh... Fuck... How did this happen?
+		end
+	else
+		AudioSystem.DeltaSoundCache[identifier] = table.Copy(soundData)
+		net.Start("AudioSystem_AcknowledgeDelta")
+			net.WriteString(identifier)
+		net.SendToServer()
+	end
+
+	PrintTable(soundData)
 
 	-- NOTE: We intentionally do this only for sounds played by the server since they won't possibly move the channel independantly.
 	-- While clientside, the channel could be moved after PlaySound was called so if we forced it into mono we could break things.
 	if soundData.entity ~= nil and soundData.entity == AudioSystem.LocalEntIndex then
 		soundData.forceSterio = true -- We are playing the sound on the local player, so we switch it to sterio for hopefully better quality & for no 3D audio bugs since the audio source is exacty at the ear position.
 	end
+
+	soundData.isServerside = true -- Sound was played by the server.
 
 	AudioSystem.PlaySound(soundData)
 end)
@@ -989,4 +1068,8 @@ net.Receive("AudioSystem_FadeSound", function() -- ToDo: Fix this function
 	if not channel then return end
 
 	AudioSystem.FadeTo(channel, fadeTime, targetVolume)
+end)
+
+net.Receive("AudioSystem_EntityRemoved", function()
+	local entIndex = net.ReadUInt(MAX_EDICT_BITS)
 end)

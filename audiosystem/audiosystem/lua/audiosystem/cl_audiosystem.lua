@@ -5,8 +5,14 @@ AudioSystem.DeltaSoundCache = AudioSystem.DeltaSoundCache or {}
 AudioSystem.BackgroundChannel = AudioSystem.BackgroundChannel or nil
 AudioSystem.ChannelIDs = AudioSystem.ChannelIDs or 0 -- Incremental number to assign channel id's
 AudioSystem.UpdateFrequency = 0.05 -- How often timers execute to update the volume when fading it to a new value.
+AudioSystem.ServerGroupVolumes = AudioSystem.ServerGroupVolumes or {} -- Group volume mulipliers added on top of channel volumes controlled by the server
+AudioSystem.ClientGroupVolumes = AudioSystem.ClientGroupVolumes or {} -- Group volume mulipliers added on top of channel volumes controlled by the client
+AudioSystem.ModifiedChannelGroups = AudioSystem.ModifiedChannelGroups or {}
 
+-- These intentionally are nuked on autorefresh
 local ErrorList = {} -- A table containing all the files we failed to open, if the file is in this list and we fail loading again, then we won't throw another error.
+local Fake3DList = {}
+local OGGRetryList = {} -- RaphaelIT7: We remapp ogg files from the VFS to a location actually on disk as it seems like things mounted through GMA cause bass to fail?
 
 -- So that we don't depend on the GameData table as this system is meant to also work as a standalone library.
 AudioSystem.IsSinglePlayer = AudioSystem.IsSinglePlayer or game.SinglePlayer()
@@ -70,18 +76,71 @@ function AudioSystem.CreateChannel(soundFile, mode, callback, errorCallback)
 		return
 	end
 
+	local usedOGGRemap = false
+	if OGGRetryList[soundFile] then
+		soundFile = OGGRetryList[soundFile]
+		usedOGGRemap = true
+	end
+
 	local soundFunc = isURL and sound.PlayURL or sound.PlayFile
 	soundFunc(soundFile, mode, function(channel, errCode, errStr)
 		if not IsValid(channel) then
 			if errorCallback then
-				errorCallback(errCode, errStr)
+				-- an error callback can return true to cancel us throwing an error
+				if errorCallback(errCode, errStr) then return end
 			end
-
+			
 			if not ErrorList[soundFile] then
 				ErrorList[soundFile] = true
-				error("[AudioSystem] Failed to create audio channel! (" .. errCode .. ", " .. errStr .. ", " .. soundFile .. ")\n")
+
+				-- RaphaelIT7: This one specific OGG issue >:(
+				if string.EndsWith(soundFile, ".ogg") and errStr == "BASS_ERROR_FILEFORM" and OGGRetryList[soundFile] == nil then
+					local folderName = soundFile
+					local lastSlash = string.find(folderName, "/")
+					local currentSlash = lastSlash
+					while currentSlash do
+						lastSlash = currentSlash
+						currentSlash = string.find(folderName, "/", currentSlash + 1)
+					end
+
+					if lastSlash then
+						folderName = string.sub(folderName, 0, lastSlash)
+					end
+
+					-- RaphaelIT7: Let's write the file to disk to avoid VFS issues
+					file.CreateDir("audiosystem_oggcache/" .. folderName)
+
+					local oggRetryName = "audiosystem_oggcache/" .. soundFile
+					file.Write(oggRetryName, file.Read(soundFile, "GAME"))
+
+					oggRetryName = "data/" .. oggRetryName
+					OGGRetryList[soundFile] = oggRetryName
+					OGGRetryList[oggRetryName] = soundFile
+					
+					AudioSystem.CreateChannel(soundFile, mode, callback, errorCallback)
+					return
+				end
+
+				-- RaphaelIT7: Temporary debug stuff for Rubat.
+				local size = file.Size(soundFile, "GAME")
+				local content = file.Read(soundFile, "GAME")
+				ErrorNoHaltWithStack("[AudioSystem] Failed to create audio channel! (" .. errCode .. ", " .. errStr .. ", " .. soundFile .. " | Debug Info: File Size:" .. tostring(size or -1) .. " File Content Size:" .. tostring(content and string.len(content) or -1) .. " File Content Hash:" .. (content and util.CRC(content) or "[no content]") .. "\n")
 			end
 			return
+		else
+			--[[if usedOGGRemap and game.IsDedicated() then -- RapahelIT7: Let me find this in the server logs
+				local size = file.Size(soundFile, "GAME")
+				local content = file.Read(soundFile, "GAME")
+				local VFSsize = file.Size(OGGRetryList[soundFile], "GAME")
+				local VFScontent = file.Read(OGGRetryList[soundFile], "GAME")
+				ErrorNoHaltWithStack(
+					"(Debug message - ignore this) Managed to play previously failing OGG file from disk! (" .. soundFile .. ") | Debug Info: File Size:["
+					.. tostring(size or -1) .. "/" .. tostring(VFSsize or -1) ..
+					"] File Content Size:"
+					.. tostring(content and string.len(content) or -1) .. "/" .. tostring(VFScontent and string.len(VFScontent) or -1) ..
+					" File Content Hash:"
+					.. (content and util.CRC(content) or "[no content]") .. "/" .. (VFScontent and util.CRC(VFScontent) or "[no content]") .. "\n")
+			end]]
 		end
 
 		AudioSystem.CheckChannels()
@@ -213,7 +272,7 @@ end
 	if no startDistance or no startEndDistance is set, the initial Silent zone won't exist.
 	if no minDistance or no maxDistance is set, the final Silent zone won't exist.
 ]]
-local function CalculateFadeVolume(playerPos, channelPos, initialVolume, soundData)
+local function CalculateChannelFadeVolume(playerPos, channelPos, initialVolume, soundData)
 	local distance = channelPos:Distance(playerPos)
 
 	local startDistance = soundData.startDistance
@@ -249,19 +308,250 @@ end
 
 local fallbackPosition = Vector(0, 0, 0)
 local function GetLocalPlayerPosition() -- We can get net messages received before the local player is valid, so we fallback to the world origin until them.
-	return AudioSystem.ValidLocalPlayer and AudioSystem.LocalPlayer:GetPos() or fallbackPosition
+	return AudioSystem.ValidLocalPlayer and AudioSystem.LocalPlayer:EyePos() or fallbackPosition
 end
 
--- Helper function to wrap around CalculateFadeVolume
+local function ReflectRay(incident, normal)
+	return incident - 2 * incident:Dot(normal) * normal
+end
+
+local function BounceRay(trace, playerPos, debugDraw, inDir, bounces)
+	local tr = trace
+	local totalBounces = bounces
+	for k=1, bounces do -- Time to make some ray's bounce.
+		local incidentDir = k == 1 and inDir or (tr.HitPos - tr.StartPos):GetNormalized()
+		local bounceDir = ReflectRay(incidentDir, tr.HitNormal)
+		bounceDir:Mul(1000)
+		tr = util.TraceLine({
+			start = tr.HitPos,
+			endpos = tr.HitPos + bounceDir,
+			filter = filterEnts,
+			mask = MASK_VISIBLE_AND_NPCS,
+			collisiongroup = COLLISION_GROUP_INTERACTIVE
+		})
+
+		--print(tr.StartPos, engine.TickCount(), bounceDir, incidentDir)
+
+		if debugDraw then
+			debugoverlay.Line(tr.StartPos, tr.HitPos, 1, Color(255, 0, 0))
+			debugoverlay.Axis(tr.HitPos, tr.HitNormal:Angle(), 10)
+		end
+
+		local playerTR = util.TraceLine({
+			start = tr.HitPos,
+			endpos = playerPos,
+			filter = filterEnts,
+			mask = MASK_VISIBLE_AND_NPCS,
+			collisiongroup = COLLISION_GROUP_WORLD
+		})
+
+		if not playerTR.Hit then
+			if debugDraw then
+				debugoverlay.Line(tr.HitPos, playerPos - Vector(0, 0, 20), 1, Color(0, 255, 0)) -- We offset playerPos since else it's difficult to see
+				debugoverlay.Axis(tr.HitPos, tr.HitNormal:Angle(), 10, 1)
+			end
+
+			return tr, k, playerTR
+		end
+	end
+
+	return tr, totalBounces
+end
+
+local function RotateDirection(direction, angleDegrees, axis)
+	local ang = direction:Angle()
+	ang:RotateAroundAxis(axis, angleDegrees)
+	return ang:Forward()
+end
+
+--[[ This doesn't achieve great results :/
+
+local raytraceVectors = {}
+local raytraceYawSteps = 8
+local raytracePitchSteps = 6
+local raytraceBaseDir = Vector(1, 1, 1)
+local raytraceVec001 = Vector(0, 0, 1)
+for yaw = -60, 60, 120 / raytraceYawSteps do
+	for pitch = -30, 30, 60 / raytracePitchSteps do
+		local dir = RotateDirection(raytraceBaseDir, yaw, raytraceVec001)
+		dir = RotateDirection(dir, pitch, dir:Cross(raytraceVec001))
+		table.insert(raytraceVectors, dir)
+	end
+end]]
+
+local function AverageVectors(vectors)
+	local sum = Vector(0, 0, 0)
+	if #vectors == 0 then
+		return sum
+	end
+
+	for _, vec in ipairs(vectors) do
+		sum = sum + vec
+	end
+
+	return sum / #vectors
+end
+
+local nextDebugDraw = 0
+local function CalculateRayTracedVolume(channel, channelData, soundData, channelPos, playerPos, initialVolume)
+	if not soundData.raytraced or initialVolume <= 0 then
+		return initialVolume
+	end
+
+	local filterEnts = {channelData.ent, AudioSystem.LocalPlayer}
+	local tr = util.TraceLine({
+		start = channelPos,
+		endpos = playerPos,
+		filter = filterEnts,
+		mask = MASK_VISIBLE_AND_NPCS,
+		collisiongroup = COLLISION_GROUP_INTERACTIVE
+	})
+
+	if not tr.Hit then
+		return initialVolume
+	end
+
+	local debugDraw = nextDebugDraw < CurTime()
+	if debugDraw then
+		--debugoverlay.Line(tr.StartPos, tr.HitPos, 1)
+		--debugoverlay.Axis(tr.HitPos, tr.HitNormal:Angle(), 10)
+		nextDebugDraw = CurTime() + 0.1
+	end
+
+	local raytraceVectors = {}
+	local raytraceYawSteps = 12
+	local raytracePitchSteps = 8
+	local raytraceBaseDir = (playerPos - channelPos):GetNormalized()
+	local raytraceVec001 = Vector(0, 0, 1)
+	for yaw = -60, 60, 120 / raytraceYawSteps do
+		for pitch = -30, 30, 60 / raytracePitchSteps do
+			local dir = RotateDirection(raytraceBaseDir, yaw, raytraceVec001)
+			dir = RotateDirection(dir, pitch, dir:Cross(raytraceVec001))
+			table.insert(raytraceVectors, dir)
+		end
+	end
+
+	local hitPos = {} -- We contain all traces that managed to reach the player
+	local totalBounces = 8
+	local shortestBounce = totalBounces
+	tr.HitPos = channelPos
+	for _, dir in ipairs(raytraceVectors) do
+		local tr = util.TraceLine({
+			start = channelPos,
+			endpos = channelPos + dir * 1000,
+			filter = filterEnts,
+			mask = MASK_VISIBLE_AND_NPCS,
+			collisiongroup = COLLISION_GROUP_INTERACTIVE
+		})
+
+		local tr, totalBounces, playerTR = BounceRay(tr, playerPos, debugDraw, dir, totalBounces)
+		if shortestBounce > totalBounces then
+			shortestBounce = totalBounces
+		end
+
+		if playerTR then
+			table.insert(hitPos, playerTR.StartPos)
+			--debugoverlay.Sphere(playerTR.StartPos, 10, 1, Color(0, 0, 255), true)
+		end
+	end
+
+	--print(initialVolume - ((totalBounces - (totalBounces - shortestBounce)) / 10), LerpVector(0.5, channelPos, AverageVectors(hitPos)))
+	if #hitPos > 0 then
+		channelData.raytracedTarget = LerpVector(0.75, channelPos, AverageVectors(hitPos)) -- We lerp all hit traces into one and change the channel position giving the illusion that the audio source moved.
+	end
+
+	channelData.raytracedPos = LerpVector(0.05, channelData.raytracedPos or channelData.pos, channelData.raytracedTarget or channelData.pos)
+	channelData.pos = channelData.raytracedPos -- We can't save it in .pos since it's reset every frame
+
+	local vol = CalculateChannelFadeVolume(playerPos, channelData.pos, initialVolume, soundData)
+	initialVolume = initialVolume - (initialVolume - vol) -- Not perfect but it helps against stopping it from jumping up in volume since the distance changes
+
+	if debugDraw then
+		debugoverlay.Sphere(channelData.pos, 10, 1, Color(0, 0, 255), true)
+	end
+
+	return math.max(initialVolume - ((totalBounces - (totalBounces - shortestBounce)) / 10), 0)
+end
+
+local function AddModifyChannelGroup(channel, channelData)
+	if not channelData.modifyGroups or not channelData.modifyGroupVolumeMult then return end
+
+	for _, name in ipairs(channelData.modifyGroups) do
+		local groupTbl = AudioSystem.ModifiedChannelGroups[name]
+		if not groupTbl then
+			groupTbl = {}
+			AudioSystem.ModifiedChannelGroups[name] = groupTbl
+		end
+
+		groupTbl[channel] = true
+		if (groupTbl.modifyGroupVolumeMult or 99) > channelData.modifyGroupVolumeMult then
+			groupTbl.modifyGroupVolumeMult = channelData.modifyGroupVolumeMult
+		end
+	end
+end
+
+local function RemoveModifyChannelGroup(channel, channelData)
+	if not channelData.modifyGroups then return end
+
+	for _, name in ipairs(channelData.modifyGroups) do
+		local groupTbl = AudioSystem.ModifiedChannelGroups[name]
+		if not groupTbl then continue end
+
+		groupTbl[channel] = nil
+		if (groupTbl.modifyGroupVolumeMult or 99) == channelData.modifyGroupVolumeMult then
+			-- We were the one enforcing, so now we gotta find someone else.
+			groupTbl.modifyGroupVolumeMult = 99
+			local found = false
+			for otherChannel, val in pairs(groupTbl) do
+				if not isbool(val) or not IsValid(otherChannel) then continue end
+
+				local otherChannelData = AudioSystem.Channels[otherChannel]
+				if not otherChannelData or not otherChannelData.modifyGroupVolumeMult then continue end
+
+				if groupTbl.modifyGroupVolumeMult > otherChannelData.modifyGroupVolumeMult then
+					groupTbl.modifyGroupVolumeMult = otherChannelData.modifyGroupVolumeMult
+				end
+			end
+
+			if not found then
+				-- Found no alternative? Nuke group.
+				AudioSystem.ModifiedChannelGroups[name] = nil
+			end
+		end
+	end
+end
+
+-- Helper function to wrap around CalculateChannelFadeVolume
 local function CalculateChannelVolume(channel, targetVol)
 	local channelData = AudioSystem.Channels[channel]
+	if channelData.group then
+		local modifyGroupTbl = AudioSystem.ModifiedChannelGroups[channelData.group]
+		if modifyGroupTbl then
+			targetVol = targetVol * modifyGroupTbl.modifyGroupVolumeMult
+		end
+	end
+
 	if channelData.is3D or channelData.pos then
-		local channelData = AudioSystem.Channels[channel]
-		if channelData then
-			local soundData = channelData.soundData
-			if soundData then
-				return CalculateFadeVolume(GetLocalPlayerPosition(), channelData.pos or channel:GetPos(), targetVol, soundData)
+		local soundData = channelData.soundData
+		if soundData then
+			local playerPos = GetLocalPlayerPosition()
+			local channelPos = channelData.pos or channel:GetPos()
+			local volume = CalculateChannelFadeVolume(playerPos, channelPos, targetVol, soundData)
+			volume = CalculateRayTracedVolume(channel, channelData, soundData, channelPos, playerPos, volume)
+
+			if channelData.group then
+				local serverGroupVolume = AudioSystem.ServerGroupVolumes[channelData.group]
+				if serverGroupVolume then
+					volume = volume * math.Clamp(serverGroupVolume, 0, 5)
+				end
+
+				local clientGroupVolume = AudioSystem.ClientGroupVolumes[channelData.group]
+				if clientGroupVolume then
+					volume = volume * math.Clamp(clientGroupVolume, 0, 5)
+				end
 			end
+
+			return volume
 		end
 	end
 
@@ -277,6 +567,13 @@ function AudioSystem.EnsureValidVolume(volume)
 	return 0 -- math.Clamp(volume, -10, 10) -- We return 0 as else if it would clamp to 10 it could errape the client.
 end
 
+-- Callback called before a channel is gc'd / completely destroyed.
+local function OnDestoryChannel(channel, channelData)
+	if not channelData then return end -- Should never happen, though you never know.
+
+	RemoveModifyChannelGroup(channel, channelData)
+end
+
 --[[
 	Fades out and destroys the channel.
 	callback = function(channelData) end
@@ -286,7 +583,7 @@ function AudioSystem.DestroyChannel(channel, fadeOutTime, callback)
 		local vol = channel:GetVolume()
 		if vol > 0 then
 			local id = AudioSystem.GetChannelID(channel)
-			timer.Remove("AudioSystem:FadeToAudioChannel" .. id) -- Remove any fadeIn timer that might exist
+			timer.Remove("AudioSystem:FadeToVolumeAudioChannel" .. id) -- Remove any fadeIn timer that might exist
 			local timerName = "AudioSystem:ShutdownAudioChannel" .. id
 			local updateFreq = AudioSystem.UpdateFrequency
 			local volumeDecrement = vol / math.ceil(fadeOutTime / updateFreq)
@@ -298,6 +595,8 @@ function AudioSystem.DestroyChannel(channel, fadeOutTime, callback)
 					channelData.volume = nil
 					if IsValid(channel) then
 						channel:Stop()
+
+						OnDestoryChannel(channel, channelData)
 						channel:__gc()
 					end
 					AudioSystem.CheckChannels()
@@ -323,15 +622,18 @@ function AudioSystem.DestroyChannel(channel, fadeOutTime, callback)
 		end
 	end
 
-	AudioSystem.CheckChannels()
-	AudioSystem.Channels[channel] = nil
 	if IsValid(channel) then
+		OnDestoryChannel(channel, AudioSystem.Channels[channel])
+
 		channel:__gc()
 
 		if callback then
 			callback(channelData)
 		end
 	end
+
+	AudioSystem.CheckChannels()
+	AudioSystem.Channels[channel] = nil
 end
 
 --[[
@@ -340,7 +642,7 @@ end
 
 	NOTE: When called multiple times, the callback will only be called when the fade actually finishes, when its overwritten it won't be called.
 ]]
-local function UpdateFadeToVolume(targetVol, vol, volumeIncrement, lowerVol, channelData, callback, timerName, channel)
+local function UpdateFadeToVolume(targetVol, vol, volumeIncrement, lowerVol, channelData, callback, timerName, channel, isVolume)
 	local reachedTarget = false
 	if lowerVol then
 		reachedTarget = targetVol >= vol
@@ -349,7 +651,11 @@ local function UpdateFadeToVolume(targetVol, vol, volumeIncrement, lowerVol, cha
 	end
 
 	if !IsValid(channel) or reachedTarget then
-		channelData.volume = nil
+		if isVolume then
+			channelData.volume = nil
+		else
+			channelData.playbackRate = nil
+		end
 		timer.Remove(timerName)
 		if callback then
 			callback(channel, channelData)
@@ -363,29 +669,55 @@ local function UpdateFadeToVolume(targetVol, vol, volumeIncrement, lowerVol, cha
 		vol = vol + volumeIncrement
 	end
 
-	local channelVolume = CalculateChannelVolume(channel, vol)
-	channelData.volume = channelVolume
-	channel:SetVolume(AudioSystem.EnsureValidVolume(channelVolume))
+	if isVolume then
+		local channelVolume = CalculateChannelVolume(channel, vol)
+		channelData.volume = AudioSystem.EnsureValidVolume(channelVolume)
+		channel:SetVolume(channelData.volume)
+	else
+		channelData.playbackRate = AudioSystem.EnsureValidVolume(vol)
+		channel:SetPlaybackRate(channelData.playbackRate)
+	end
+
 	return vol
 end
 
-function AudioSystem.FadeTo(channel, fadeTime, targetVol, callback)
+function AudioSystem.FadeToVolume(channel, fadeTime, targetVol, callback)
 	targetVol = targetVol or 1
 	fadeTime = fadeTime or 1
 
 	local vol = AudioSystem.EnsureValidVolume(channel:GetVolume())
 	local lowerVol = targetVol < vol
 	local id = AudioSystem.GetChannelID(channel)
-	local timerName = "AudioSystem:FadeToAudioChannel" .. id
+	local timerName = "AudioSystem:FadeToVolumeAudioChannel" .. id
 	local updateFreq = AudioSystem.UpdateFrequency
 	local volumeIncrement = math.abs(targetVol - vol) / math.ceil(fadeTime / updateFreq)
 	local channelData = AudioSystem.Channels[channel]
 	timer.Create(timerName, updateFreq, 0, function() -- Let the sound fade away
-		vol = UpdateFadeToVolume(targetVol, vol, volumeIncrement, lowerVol, channelData, callback, timerName, channel)
+		vol = UpdateFadeToVolume(targetVol, vol, volumeIncrement, lowerVol, channelData, callback, timerName, channel, true)
 	end)
 
 	-- Do one update outside the timer, since if you call this function every frame for some reason, the timer may never execute.
-	vol = UpdateFadeToVolume(targetVol, vol, volumeIncrement, lowerVol, channelData, callback, timerName, channel)
+	vol = UpdateFadeToVolume(targetVol, vol, volumeIncrement, lowerVol, channelData, callback, timerName, channel, true)
+end
+
+-- Sounds shit if you keep the channel synced like how the background channel does.
+function AudioSystem.FadeToPlaybackRate(channel, fadeTime, targetPlaybackRate, callback)
+	targetPlaybackRate = targetPlaybackRate or 1
+	fadeTime = fadeTime or 3
+
+	local vol = AudioSystem.EnsureValidVolume(channel:GetPlaybackRate())
+	local lowerVol = targetPlaybackRate < vol
+	local id = AudioSystem.GetChannelID(channel)
+	local timerName = "AudioSystem:FadeToPlaybackRateAudioChannel" .. id
+	local updateFreq = AudioSystem.UpdateFrequency
+	local volumeIncrement = math.abs(targetPlaybackRate - vol) / math.ceil(fadeTime / updateFreq)
+	local channelData = AudioSystem.Channels[channel]
+	timer.Create(timerName, updateFreq, 0, function() -- Let the sound fade away
+		vol = UpdateFadeToVolume(targetPlaybackRate, vol, volumeIncrement, lowerVol, channelData, callback, timerName, channel, false)
+	end)
+
+	-- Do one update outside the timer, since if you call this function every frame for some reason, the timer may never execute.
+	vol = UpdateFadeToVolume(targetPlaybackRate, vol, volumeIncrement, lowerVol, channelData, callback, timerName, channel, false)
 end
 
 function AudioSystem.StopBackgroundMusic()
@@ -395,7 +727,7 @@ end
 
 -- Returns the calculated time a channel is supposed to be at, it accounts for looping sounds
 function AudioSystem.CalculateTime(channel, tickCount, looping)
-	local calculateTime = (engine.TickCount() - tickCount) * engine.TickInterval()
+	local calculateTime = ((engine.TickCount() - tickCount) * engine.TickInterval()) * channel:GetPlaybackRate()
 	local fileLength = channel:GetLength()
 	if not looping then -- If we don't want looping, then we simply return the normal time without any more calculations.
 		return math.min(calculateTime, fileLength)
@@ -431,12 +763,14 @@ function AudioSystem.PlayBackgroundMusic(fileName)
 
 	AudioSystem.CreateChannel(backgroundMusic, "noplay", function(channel)
 		AudioSystem.BackgroundChannel = channel
+		AudioSystem.Channels[channel].group = "BackgroundMusic"
 
 		channel:SetVolume(0)
 		channel:Play()
 		channel:EnableLooping(true)
 		channel:SetTime(AudioSystem.GetBackgroundMusicTime())
-		AudioSystem.FadeTo(channel, 3, AudioSystem.GetBackgroundMusicVolume())
+		channel:SetPlaybackRate(AudioSystem.GetBackgroundMusicPlaybackRate())
+		AudioSystem.FadeToVolume(channel, 3, AudioSystem.GetBackgroundMusicVolume())
 	end)
 end
 
@@ -459,7 +793,14 @@ end
 -- Did you know? This was one too >:3
 local function OnBackgroundMusicVolumeChange(ent, name, old, new)
 	if IsValid(AudioSystem.BackgroundChannel) then
-		AudioSystem.FadeTo(AudioSystem.BackgroundChannel, 3, new)
+		AudioSystem.FadeToVolume(AudioSystem.BackgroundChannel, 3, new)
+	end
+end
+
+-- Guess what? Another one >:3c
+local function OnBackgroundMusicPlaybackRateChange(ent, name, old, new)
+	if IsValid(AudioSystem.BackgroundChannel) then
+		AudioSystem.BackgroundChannel:SetPlaybackRate(new)
 	end
 end
 
@@ -482,6 +823,9 @@ function AudioSystem.Init()
 
 	world:SetNW2VarProxy("AudioSystem:BackgroundMusicVolume", OnBackgroundMusicVolumeChange)
 	OnBackgroundMusicVolumeChange(world, "AudioSystem:BackgroundMusicVolume", nil, AudioSystem.GetBackgroundMusicVolume())
+
+	world:SetNW2VarProxy("AudioSystem:BackgroundMusicPlaybackRate", OnBackgroundMusicPlaybackRateChange)
+	OnBackgroundMusicPlaybackRateChange(world, "AudioSystem:BackgroundMusicPlaybackRate", nil, AudioSystem.GetBackgroundMusicPlaybackRate())
 end
 
 hook.Add("InitPostEntity", "AudioSystem:AudioSystem", AudioSystem.Init)
@@ -519,7 +863,7 @@ function CalculatePan(ply, channelPos)
 	return math.Clamp(pan, -1, 1)
 end
 
-local function UpdateChannelPosition(channel, channelData, localPlyPos)
+local function UpdateChannelPositionAndVolume(channel, channelData, localPlyPos)
 	local soundData = channelData.soundData
 	if not soundData then return end
 
@@ -533,16 +877,16 @@ local function UpdateChannelPosition(channel, channelData, localPlyPos)
 				newPos = ent:WorldSpaceCenter() -- If possible, use the EyePos, but if the EyePos matches the Entity's position, we use the WorldSpaceCenter as a better position.
 			end
 
-			if channelData.is3D then -- We don't need to call it when the position isn't saved anyways as for non-3d channels the position is always Vector(0, 0, 0)
+			if channelData.is3D and not soundData.raytraced then -- We don't need to call it when the position isn't saved anyways as for non-3d channels the position is always Vector(0, 0, 0)
 				channel:SetPos(newPos)
-			else
-				channelData.pos = newPos -- Since non-3d channels :GetPos will always be the world origin, we store our position in here instead.
 			end
+			
+			channelData.pos = newPos -- Since non-3d channels :GetPos will always be the world origin, we store our position in here instead.
 		end
 	end
 
 	if newPos and soundData.minDistance and soundData.maxDistance then
-		local volume = CalculateFadeVolume(localPlyPos or GetLocalPlayerPosition(), newPos, channelData.volume or soundData.volume, soundData)
+		local volume = CalculateChannelVolume(channel, channelData.volume or soundData.volume)
 		
 		if soundData.dynamicPan then
 			channel:SetPan(CalculatePan(AudioSystem.LocalPlayer, newPos))
@@ -559,22 +903,26 @@ local function UpdateChannelPosition(channel, channelData, localPlyPos)
 		end]]
 		--print("3D", channel, channelData.ID, volume)
 	end
+
+	if soundData.raytraced and channelData.pos then -- It may change the channel position
+		channel:SetPos(channelData.pos)
+	end
 end
 
-local function UpdateChannelPositions()
+local function UpdateChannelPositionsAndVolumes()
 	local localPlyPos = GetLocalPlayerPosition()
 	for channel, channelData in pairs(AudioSystem.Channels) do
 		--[[
 			Why don't we remove the channel if the parent is gone?
 			Because on full updates, the parent might disappear and then reappear.
 		]]
-		UpdateChannelPosition(channel, channelData, localPlyPos)
+		UpdateChannelPositionAndVolume(channel, channelData, localPlyPos)
 	end
 end
 
 function AudioSystem.Think()
 	UpdateBackgroundMusic()
-	UpdateChannelPositions()
+	UpdateChannelPositionsAndVolumes()
 end
 
 --[[
@@ -685,19 +1033,23 @@ end)
 		number pan - The sound pan - See https://wiki.facepunch.com/gmod/IGModAudioChannel:SetPan
 		number playbackRate - The sound playback rate.
 		boolean noplay - Won't automatically play the sound
-		string group - If set, a hook is called allowing you to add a hook that is executed when a sound is played like this: hook.Add("AudioSystem:AudioSystem:PlaySound:ExampleGroup", "Example", function(soundData, channel))
+		string group - If set, a hook is called allowing you to add a hook that is executed when a sound is played like this: hook.Add("AudioSYstem:AudioSystem:PlaySound:ExampleGroup", "Example", function(soundData, channel))
 		boolean deleteWhenDone - If true, the channel is deleted once the sound finished playing (will ignore looping flag and still stop it).
 		number fadeIn - How many seconds it takes for the song to fade in at the start of it.
 		number fadeOut - How many seconds before the ending it should start to fade out, and when it faded out the channel is destroyed.
 		number fadeOutStart - How many seconds after the sound start it should begin to fade out. Use negative number to use a time based off the end of the sound instead of the start.
-		boolean forceMono - Forces the sound to play as mono. Perferably use forceSterio since it won't butcher the sound quality.
-		boolean forceSterio - Forces the sound to play as sterio. This doesn't really force it to be sterio but rather it removes the mono or 3d flag if they have been set.
+		boolean forceMono - Forces the sound to play as mono. Perferably use forceStereo since it won't butcher the sound quality.
+		boolean forceStereo - Forces the sound to play as sterio. This doesn't really force it to be sterio but rather it removes the mono or 3d flag if they have been set.
 		boolean noWorldSpace - If set it will use the entities EyePos instead of falling back to using it's WorldSpaceCenter position.
 		boolean dynamicPan - If set it will calculate the pan for the channel giving the sound a 3D effect.
 		string fallbackSoundPath - The fallback sound when the bound ConVar is disabled.
 		string boundConVar - A ConVar the sound is bound to, when the ConVar is false then it will instead play the set fallbackSoundPath
 		boolean disableUniqueToEntity - If set, the entity index is NOT added to the identifier allowing the sound to be played only ONCE and NOT by multiple entities.
 		boolean disableAutoRemove - If set, the channel won't be removed after the entity of the channel was removed.
+		boolean raytraced - If set, it will use traces to change the volume and position based off the environment. NOTE: This is WIP, Experiental and eats performance like hell rn
+		string modifyGroup - A string containing all channel groups that should be modified while this channel is playing
+		number modifyGroupVolumeMult - The volume multiplier that should be enforced onto all channels
+		number modifyGroupVolumeFadeTime - (NOT IMPLEMENTED) Time in seconds for the volume to fade to the enforced multiplier. Clamped between a minimum of 0 and maximum of 30
 
 		table pulseEffect - A table for the pulse effect. NOTE: This is still WIP and should not be used.
 		-> Entity entity - A entity that should pulse
@@ -714,9 +1066,9 @@ end)
 		startDistance and startEndDistance act as a distance to fadeOut the volume when you get too close, where startEndDistance is the point when the sound is on full volume while at startDistance it will be completely faded out.
 		See the comment above the CalculateFadeVolume for reference.
 
-		all distance fields work regardless of the channel being in 3D or not, so you can use forceSterio and still use minDistance/maxDistance without issues.
+		all distance fields work regardless of the channel being in 3D or not, so you can use forceStereo and still use minDistance/maxDistance without issues.
 
-		You can combine forceSterio and dynamicPan to give sounds a fake 3D effect while keeping the quality of them being in sterio/using multiple channels instead of the normal 3D that forces them into mono.
+		You can combine forceStereo and dynamicPan to give sounds a fake 3D effect while keeping the quality of them being in sterio/using multiple channels instead of the normal 3D that forces them into mono.
 ]]
 function AudioSystem.PlaySound(soundData)
 	local soundPath = soundData.soundPath
@@ -767,6 +1119,12 @@ function AudioSystem.PlaySound(soundData)
 	local useMode = "" -- By default we use sterio since it sounds far better than mono.
 	if entIndex > 0 or soundData.position then
 		useMode = "3d"
+
+		-- The sound is played in 3D when it isn't mono, so we fake 3D
+		if Fake3DList[soundPath] then
+			useMode = ""
+			soundData.dynamicPan = true
+		end
 	end
 
 	if soundData.forceMono then
@@ -774,7 +1132,7 @@ function AudioSystem.PlaySound(soundData)
 	end
 
 	-- Useful when it has a position/entity but you still want to play it as sterio.
-	if soundData.forceSterio then
+	if soundData.forceStereo then
 		useMode = ""
 	end
 
@@ -806,7 +1164,7 @@ function AudioSystem.PlaySound(soundData)
 		end
 
 		if soundData.fadeIn and soundData.fadeIn ~= 0 then
-			AudioSystem.FadeTo(channel, soundData.fadeIn, soundData.volume)
+			AudioSystem.FadeToVolume(channel, soundData.fadeIn, soundData.volume)
 		end
 
 		if entIndex ~= 0 then
@@ -842,7 +1200,16 @@ function AudioSystem.PlaySound(soundData)
 		if IsEntity(soundData.entity) then -- If they gave us an entity, copy it over and use it to support clientside entities since we cannot use the EntIndex for thoes.
 			channelData.ent = soundData.entity
 		end
-		UpdateChannelPosition(channel, channelData) -- Update the channel position so that when we play it, there won't be a audio bug for 1 frame where it would play from the world origin.
+		UpdateChannelPositionAndVolume(channel, channelData) -- Update the channel position so that when we play it, there won't be a audio bug for 1 frame where it would play from the world origin.
+
+		if soundData.modifyGroup then
+			channelData.modifyGroups = string.Split(soundData.modifyGroup, "|")
+			channelData.modifyGroupVolumeMult = math.Clamp(soundData.modifyGroupVolumeMult or 0, 0, 2)
+			channelData.modifyGroupVolumeFadeTime = math.Clamp(soundData.modifyGroupVolumeFadeTime or 0, 0, 30)
+			channelData.modifyGroupStart = CurTime()
+
+			AddModifyChannelGroup(channel, channelData)
+		end
 
 		if not soundData.noplay and (timeLeft > 0 or soundData.looping) then -- We call Play only here since some settings might change how it can be heard.
 			channel:Play()
@@ -883,6 +1250,14 @@ function AudioSystem.PlaySound(soundData)
 		end
 	end, function(errCode, errStr)
 		AudioSystem.CreatingChannels[soundData.identifier] = nil -- Error happened, just clear it out from creation.
+
+		if errStr == "BASS_ERROR_NO3D" and not Fake3DList[soundPath] then
+			print("[AudioSystem] Sound \"" .. soundPath .. "\" was attempted to be played as 3D when it's not. Falling back to fake 3D!")
+			Fake3DList[soundPath] = true
+			AudioSystem.PlaySound(soundData)
+
+			return true
+		end
 	end)
 end
 
@@ -937,7 +1312,7 @@ function AudioSystem.StopSound(identifier, fadeOut, entIndex)
 		return
 	end
 
-	-- We use or and do identifier .. entIndex since if a sound has makeUniqueToEntity set, it will append the EntIndex to our identifier
+	-- We use or and do identifier .. entIndex since if a sound didn't use disableUniqueToEntity, it will append the EntIndex to our identifier
 	local creationSounData = AudioSystem.CreatingChannels[identifier] or AudioSystem.CreatingChannels[identifier .. (entIndex or "")]
 	if creationSounData then -- The channel wasn't created yet, so we cannot stop it. Instead we'll set a flag.
 		creationSounData.DESTROYCHANNEL = true
@@ -989,9 +1364,8 @@ local function DeltaMerge(deltaTable, baseTable)
 end
 deltaMerge = DeltaMerge
 
-net.Receive("AudioSystem_PlaySound", function()
-	local isDelta = net.ReadBool()
-	local soundData = {
+local function ReadSoundData()
+	return {
 		soundPath = ReadSoundField(net.ReadString),
 		fallbackSoundPath = ReadSoundField(net.ReadString),
 		entity = ReadSoundField(net.ReadUInt, MAX_EDICT_BITS),
@@ -1014,22 +1388,75 @@ net.Receive("AudioSystem_PlaySound", function()
 		fadeOut = ReadSoundField(net.ReadFloat),
 		fadeOutStart = ReadSoundField(net.ReadFloat),
 		forceMono = ReadSoundField(net.ReadBool),
-		forceSterio = ReadSoundField(net.ReadBool),
+		forceStereo = ReadSoundField(net.ReadBool),
 		noWorldSpace = ReadSoundField(net.ReadBool),
 		dynamicPan = ReadSoundField(net.ReadBool),
 		boundConVar = ReadSoundField(net.ReadString),
 		pulseEffect = ReadSoundField(ReadPulseEffect),
 		disableUniqueToEntity = ReadSoundField(net.ReadBool),
-		disableAutoRemove = ReadSoundField(net.ReadBool),
+		raytraced = ReadSoundField(net.ReadBool),
+		modifyGroup = ReadSoundField(net.ReadString),
+		modifyGroupVolumeMult = ReadSoundField(net.ReadFloat),
+		modifyGroupVolumeFadeTime = ReadSoundField(net.ReadFloat),
 	}
+end
 
+local function PlayServerReceivedSound(soundData)
+	-- NOTE: We intentionally do this only for sounds played by the server since they won't possibly move the channel independantly.
+	-- While clientside, the channel could be moved after PlaySound was called so if we forced it into mono we could break things.
+	if soundData.entity ~= nil and soundData.entity == AudioSystem.LocalEntIndex then
+		soundData.forceStereo = true -- We are playing the sound on the local player, so we switch it to sterio for hopefully better quality & for no 3D audio bugs since the audio source is exacty at the ear position.
+	end
+
+	soundData.isServerside = true -- Sound was played by the server.
+
+	AudioSystem.PlaySound(soundData)
+end
+
+local nextMissID = 0
+local deltaMissRecovery = {}
+net.Receive("AudioSystem_MissingDelta", function()
+	local identifier = net.ReadString()
+	local missID = net.ReadUInt(32)
+
+	local soundData = deltaMissRecovery[missID]
+	if not soundData then return end -- We failed to get the sound data that we had received on delta miss?!?
+
+	local deltaData = ReadSoundData()
+	AudioSystem.DeltaSoundCache[identifier] = table.Copy(deltaData)
+	deltaMissRecovery[missID] = nil
+
+	DeltaMerge(soundData, deltaData)
+
+	net.Start("AudioSystem_AcknowledgeDelta")
+		net.WriteString(identifier)
+	net.SendToServer()
+
+	-- print("Received delta recovery")
+	PlayServerReceivedSound(soundData)
+end)
+
+net.Receive("AudioSystem_PlaySound", function()
+	local isDelta = net.ReadBool()
+	local soundData = ReadSoundData()
 	local identifier = soundData.identifier or soundData.soundPath
 	if isDelta then
 		local baseTable = AudioSystem.DeltaSoundCache[identifier]
 		if baseTable then
 			DeltaMerge(soundData, baseTable)
 		else
-			-- Uh oh... Fuck... How did this happen?
+			-- Uh oh... Fuck... How did this happen? Normally this CANNOT happen! This is purely for absolute safety!
+			local missID = nextMissID
+			nextMissID = nextMissID + 1
+
+			deltaMissRecovery[nextMissID] = soundData
+
+			net.Start("AudioSystem_MissingDelta")
+				net.WriteString(identifier)
+				net.WriteUInt(missID, 32)
+			net.SendToServer()
+			-- print("Triggering delta recovery")
+			return -- The server will resend the delta to recover from our failure after which we can play it properly.
 		end
 	else
 		AudioSystem.DeltaSoundCache[identifier] = table.Copy(soundData)
@@ -1038,17 +1465,8 @@ net.Receive("AudioSystem_PlaySound", function()
 		net.SendToServer()
 	end
 
-	PrintTable(soundData)
-
-	-- NOTE: We intentionally do this only for sounds played by the server since they won't possibly move the channel independantly.
-	-- While clientside, the channel could be moved after PlaySound was called so if we forced it into mono we could break things.
-	if soundData.entity ~= nil and soundData.entity == AudioSystem.LocalEntIndex then
-		soundData.forceSterio = true -- We are playing the sound on the local player, so we switch it to sterio for hopefully better quality & for no 3D audio bugs since the audio source is exacty at the ear position.
-	end
-
-	soundData.isServerside = true -- Sound was played by the server.
-
-	AudioSystem.PlaySound(soundData)
+	-- PrintTable(soundData)
+	PlayServerReceivedSound(soundData)
 end)
 
 net.Receive("AudioSystem_StopSound", function()
@@ -1067,9 +1485,23 @@ net.Receive("AudioSystem_FadeSound", function() -- ToDo: Fix this function
 	local channel = AudioSystem.GetChannelByIdentifier(identifier)
 	if not channel then return end
 
-	AudioSystem.FadeTo(channel, fadeTime, targetVolume)
+	AudioSystem.FadeToVolume(channel, fadeTime, targetVolume)
 end)
 
 net.Receive("AudioSystem_EntityRemoved", function()
 	local entIndex = net.ReadUInt(MAX_EDICT_BITS)
+
+	AudioSystem.StopSound(nil, 1, entIndex)
 end)
+
+net.Receive("AudioSystem_SetGroupVolume", function()
+	local groupName = net.ReadString()
+	local groupVolume = net.ReadFloat()
+	local lerpTime = net.ReadFloat() -- ToDo
+
+	AudioSystem.ServerGroupVolumes[groupName] = groupVolume
+end)
+
+function AudioSystem.SetGroupVolume(groupName, groupVolume, lerpTime)
+	AudioSystem.ClientGroupVolumes[groupName] = groupVolume
+end

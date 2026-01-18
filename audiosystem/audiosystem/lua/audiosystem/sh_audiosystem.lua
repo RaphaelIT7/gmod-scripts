@@ -22,11 +22,11 @@ function AudioSystem.ToSound(fileName)
 end
 
 function AudioSystem.ShouldPlayBackgroundMusic()
-	return GetGlobal2Bool("SlashCo:ShouldPlayBackgroundMusic", false)
+	return GetGlobal2Bool("AudioSystem:ShouldPlayBackgroundMusic", false)
 end
 
 function AudioSystem.EnableBackgroundMusic()
-	SetGlobal2Bool("SlashCo:ShouldPlayBackgroundMusic", true)
+	SetGlobal2Bool("AudioSystem:ShouldPlayBackgroundMusic", true)
 end
 
 function AudioSystem.EnableBackgroundMusic(forced)
@@ -35,34 +35,42 @@ function AudioSystem.EnableBackgroundMusic(forced)
 	end
 
 	if AudioSystem.ForcedDisable then return end
-	SetGlobal2Bool("SlashCo:ShouldPlayBackgroundMusic", true)
+	SetGlobal2Bool("AudioSystem:ShouldPlayBackgroundMusic", true)
 end
 
 function AudioSystem.DisableBackgroundMusic(forced)
-	SetGlobal2Bool("SlashCo:ShouldPlayBackgroundMusic", false)
+	SetGlobal2Bool("AudioSystem:ShouldPlayBackgroundMusic", false)
 	AudioSystem.ForcedDisable = forced or false
 end
 
 function AudioSystem.SetBackgroundMusic(soundFile, volume)
-	SetGlobal2String("SlashCo:BackgroundMusic", soundFile)
-	SetGlobal2Float("SlashCo:BackgroundMusicVolume", volume or 1)
-	SetGlobal2Int("SlashCo:StartTimeBackgroundMusic", engine.TickCount()) -- Timestamp to syncronize the music for everyone
+	SetGlobal2String("AudioSystem:BackgroundMusic", soundFile)
+	SetGlobal2Float("AudioSystem:BackgroundMusicVolume", volume or 1)
+	SetGlobal2Int("AudioSystem:StartTimeBackgroundMusic", engine.TickCount()) -- Timestamp to syncronize the music for everyone
 
 	if DisableSoundScapes then
 		--DisableSoundScapes() -- disable sound scapes.
 	end
 end
 
-function AudioSystem.SetBackgroundMusicVolume(volume)
-	SetGlobal2Float("SlashCo:BackgroundMusicVolume", volume or 1)
+function AudioSystem.GetBackgroundMusic(fallBack)
+	return GetGlobal2String("AudioSystem:BackgroundMusic", fallBack or "")
 end
 
-function AudioSystem.GetBackgroundMusic(fallBack)
-	return GetGlobal2String("SlashCo:BackgroundMusic", fallBack or "")
+function AudioSystem.SetBackgroundMusicVolume(volume)
+	SetGlobal2Float("AudioSystem:BackgroundMusicVolume", volume or 1)
 end
 
 function AudioSystem.GetBackgroundMusicVolume(fallBack)
-	return GetGlobal2Float("SlashCo:BackgroundMusicVolume", fallBack or 1)
+	return GetGlobal2Float("AudioSystem:BackgroundMusicVolume", fallBack or 1)
+end
+
+function AudioSystem.SetBackgroundMusicPlaybackRate(playbackrate)
+	SetGlobal2Float("AudioSystem:BackgroundMusicPlaybackRate", playbackrate or 1)
+end
+
+function AudioSystem.GetBackgroundMusicPlaybackRate(fallBack)
+	return GetGlobal2Float("AudioSystem:BackgroundMusicPlaybackRate", playbackrate or 1)
 end
 
 function AudioSystem.RegisterSound(registerName, soundTable)

@@ -8,11 +8,12 @@ AudioSystem.UpdateFrequency = 0.05 -- How often timers execute to update the vol
 AudioSystem.ServerGroupVolumes = AudioSystem.ServerGroupVolumes or {} -- Group volume mulipliers added on top of channel volumes controlled by the server
 AudioSystem.ClientGroupVolumes = AudioSystem.ClientGroupVolumes or {} -- Group volume mulipliers added on top of channel volumes controlled by the client
 AudioSystem.ModifiedChannelGroups = AudioSystem.ModifiedChannelGroups or {}
+AudioSystem.LastAcknowledgedTick = AudioSystem.LastAcknowledgedTick or 0
 
 -- These intentionally are nuked on autorefresh
 local ErrorList = {} -- A table containing all the files we failed to open, if the file is in this list and we fail loading again, then we won't throw another error.
 local Fake3DList = {}
-local OGGRetryList = {} -- RaphaelIT7: We remapp ogg files from the VFS to a location actually on disk as it seems like things mounted through GMA cause bass to fail?
+local SoundRetryList = {} -- RaphaelIT7: We remapp ogg files from the VFS to a location actually on disk as it seems like things mounted through GMA cause bass to fail?
 
 -- So that we don't depend on the GameData table as this system is meant to also work as a standalone library.
 AudioSystem.IsSinglePlayer = AudioSystem.IsSinglePlayer or game.SinglePlayer()
@@ -76,10 +77,10 @@ function AudioSystem.CreateChannel(soundFile, mode, callback, errorCallback)
 		return
 	end
 
-	local usedOGGRemap = false
-	if OGGRetryList[soundFile] then
-		soundFile = OGGRetryList[soundFile]
-		usedOGGRemap = true
+	local usedSoundRemap = false
+	if SoundRetryList[soundFile] then
+		soundFile = SoundRetryList[soundFile]
+		usedSoundRemap = true
 	end
 
 	local soundFunc = isURL and sound.PlayURL or sound.PlayFile
@@ -94,7 +95,7 @@ function AudioSystem.CreateChannel(soundFile, mode, callback, errorCallback)
 				ErrorList[soundFile] = true
 
 				-- RaphaelIT7: This one specific OGG issue >:(
-				if string.EndsWith(soundFile, ".ogg") and errStr == "BASS_ERROR_FILEFORM" and OGGRetryList[soundFile] == nil then
+				if errStr == "BASS_ERROR_FILEFORM" and SoundRetryList[soundFile] == nil then
 					local folderName = soundFile
 					local lastSlash = string.find(folderName, "/")
 					local currentSlash = lastSlash
@@ -110,12 +111,12 @@ function AudioSystem.CreateChannel(soundFile, mode, callback, errorCallback)
 					-- RaphaelIT7: Let's write the file to disk to avoid VFS issues
 					file.CreateDir("audiosystem_oggcache/" .. folderName)
 
-					local oggRetryName = "audiosystem_oggcache/" .. soundFile
-					file.Write(oggRetryName, file.Read(soundFile, "GAME"))
+					local soundRetryName = "audiosystem_oggcache/" .. soundFile
+					file.Write(soundRetryName, file.Read(soundFile, "GAME"))
 
-					oggRetryName = "data/" .. oggRetryName
-					OGGRetryList[soundFile] = oggRetryName
-					OGGRetryList[oggRetryName] = soundFile
+					soundRetryName = "data/" .. soundRetryName
+					SoundRetryList[soundFile] = soundRetryName
+					SoundRetryList[soundRetryName] = soundFile
 					
 					AudioSystem.CreateChannel(soundFile, mode, callback, errorCallback)
 					return
@@ -124,22 +125,25 @@ function AudioSystem.CreateChannel(soundFile, mode, callback, errorCallback)
 				-- RaphaelIT7: Temporary debug stuff for Rubat.
 				local size = file.Size(soundFile, "GAME")
 				local content = file.Read(soundFile, "GAME")
-				ErrorNoHaltWithStack("[AudioSystem] Failed to create audio channel! (" .. errCode .. ", " .. errStr .. ", " .. soundFile .. " | Debug Info: File Size:" .. tostring(size or -1) .. " File Content Size:" .. tostring(content and string.len(content) or -1) .. " File Content Hash:" .. (content and util.CRC(content) or "[no content]") .. "\n")
+				ErrorNoHaltWithStack("[SlashCo] Failed to create audio channel! (" .. errCode .. ", " .. errStr .. ", \"" .. soundFile .. "\" | Debug Info: BRANCH:" .. tostring(BRANCH) .. " File Size:" .. tostring(size or -1) .. " File Content Size:" .. tostring(content and string.len(content) or -1) .. " File Content Hash:" .. (content and util.CRC(content) or "[no content]") .. "\n")
 			end
 			return
 		else
-			--[[if usedOGGRemap and game.IsDedicated() then -- RapahelIT7: Let me find this in the server logs
+			--[[if usedSoundRemap and game.IsDedicated() then -- RapahelIT7: Let me find this in the server logs
 				local size = file.Size(soundFile, "GAME")
 				local content = file.Read(soundFile, "GAME")
-				local VFSsize = file.Size(OGGRetryList[soundFile], "GAME")
-				local VFScontent = file.Read(OGGRetryList[soundFile], "GAME")
+				local VFSsize = file.Size(SoundRetryList[soundFile], "GAME")
+				local VFScontent = file.Read(SoundRetryList[soundFile], "GAME")
 				ErrorNoHaltWithStack(
-					"(Debug message - ignore this) Managed to play previously failing OGG file from disk! (" .. soundFile .. ") | Debug Info: File Size:["
+					"(Debug message - ignore this) Managed to play previously failing OGG file from disk! (" .. soundFile .. ") | Debug Info: "
+					.. " Branch:" .. tostring(BRANCH)
+					.. "File Size:["
 					.. tostring(size or -1) .. "/" .. tostring(VFSsize or -1) ..
 					"] File Content Size:"
 					.. tostring(content and string.len(content) or -1) .. "/" .. tostring(VFScontent and string.len(VFScontent) or -1) ..
 					" File Content Hash:"
-					.. (content and util.CRC(content) or "[no content]") .. "/" .. (VFScontent and util.CRC(VFScontent) or "[no content]") .. "\n")
+					.. (content and util.CRC(content) or "[no content]") .. "/" .. (VFScontent and util.CRC(VFScontent) or "[no content]") .. "\n"
+				)
 			end]]
 		end
 
@@ -278,28 +282,38 @@ local function CalculateChannelFadeVolume(playerPos, channelPos, initialVolume, 
 	local startDistance = soundData.startDistance
 	local startEndDistance = soundData.startEndDistance
 	if startDistance and startEndDistance then
-		if distance < startDistance then
-			return 0
-		end
+		local fadeRange = startEndDistance - startDistance
+		if fadeRange > 0 then
+			if distance < startDistance then
+				return 0
+			end
 
-		if distance < startEndDistance then
-			return initialVolume * (1 - ((distance - startEndDistance) / (startDistance - startEndDistance)))
+			if distance < startEndDistance then
+				return initialVolume * ((distance - startDistance) / fadeRange)
+			end
+		else
+			return distance < startDistance and 0 or initialVolume
 		end
 	end
 
 	local minDistance = soundData.minDistance
 	local maxDistance = soundData.maxDistance
 	if minDistance and maxDistance then
-		if distance <= minDistance then
-			return initialVolume
-		end
+		local fadeRange = maxDistance - minDistance
+		if fadeRange > 0 then
+			if distance <= minDistance then
+				return initialVolume
+			end
 
-		if distance < maxDistance then
-			return initialVolume * (1 - ((distance - minDistance) / (maxDistance - minDistance)))
-		end
+			if distance < maxDistance then
+				return initialVolume * (1 - ((distance - minDistance) / fadeRange))
+			end
 
-		if distance >= maxDistance then
-			return 0
+			if distance >= maxDistance then
+				return 0
+			end
+		else
+			return distance < minDistance and initialVolume or 0
 		end
 	end
 
@@ -521,8 +535,42 @@ local function RemoveModifyChannelGroup(channel, channelData)
 	end
 end
 
+-- ToDo: Check if we even need this function anymore or if we fixed it unknowingly that it could become nan somehow.
+function AudioSystem.EnsureValidVolume(volume)
+	if volume == volume and volume ~= math.huge and volume ~= -math.huge then -- if its not nan and not inf and not -inf, we can say its safe
+		return volume
+	end
+
+	return 0 -- math.Clamp(volume, -10, 10) -- We return 0 as else if it would clamp to 10 it could errape the client.
+end
+
+local MuteState = {
+	MUTED = 1,
+	WAS_MUTED = 2,
+	PLAYING = 3
+}
+local function ShouldMuteVolue()
+	-- RaphaelIT7: In SlashCo I may test with like 3 multirun clients soo let's only play sounds from the focused client!
+	local mute = GameData and GameData.IsLan and not system.HasFocus()
+	if mute then
+		GameData.WasAudioSystemMuted = CurTime()
+		return MuteState.MUTED
+	end
+
+	if not mute and GameData.WasAudioSystemMuted and GameData.WasAudioSystemMuted > (CurTime() - 0.5) then
+		return MuteState.WAS_MUTED
+	end
+
+	return MuteState.PLAYING
+end
+
 -- Helper function to wrap around CalculateChannelFadeVolume
-local function CalculateChannelVolume(channel, targetVol)
+local function CalculateChannelVolume(channel, targetVol, ignoreMuted)
+	-- RaphaelIT7: In SlashCo I may test with like 3 multirun clients soo let's only play sounds from the focused client!
+	if not ignoreMuted and ShouldMuteVolue() == MuteState.MUTED then
+		return 0
+	end
+
 	local channelData = AudioSystem.Channels[channel]
 	if channelData.group then
 		local modifyGroupTbl = AudioSystem.ModifiedChannelGroups[channelData.group]
@@ -551,20 +599,11 @@ local function CalculateChannelVolume(channel, targetVol)
 				end
 			end
 
-			return volume
+			return math.Clamp(AudioSystem.EnsureValidVolume(volume), 0, 1.5)
 		end
 	end
 
-	return targetVol
-end
-
--- ToDo: Check if we even need this function anymore or if we fixed it unknowingly that it could become nan somehow.
-function AudioSystem.EnsureValidVolume(volume)
-	if volume == volume then -- if its not nan, we can say its safe
-		return volume
-	end
-
-	return 0 -- math.Clamp(volume, -10, 10) -- We return 0 as else if it would clamp to 10 it could errape the client.
+	return math.Clamp(AudioSystem.EnsureValidVolume(targetVol), 0, 1.5)
 end
 
 -- Callback called before a channel is gc'd / completely destroyed.
@@ -670,9 +709,11 @@ local function UpdateFadeToVolume(targetVol, vol, volumeIncrement, lowerVol, cha
 	end
 
 	if isVolume then
-		local channelVolume = CalculateChannelVolume(channel, vol)
+		local channelVolume = CalculateChannelVolume(channel, vol, true)
 		channelData.volume = AudioSystem.EnsureValidVolume(channelVolume)
-		channel:SetVolume(channelData.volume)
+		if ShouldMuteVolue() ~= MuteState.MUTED then
+			channel:SetVolume(channelData.volume)
+		end
 	else
 		channelData.playbackRate = AudioSystem.EnsureValidVolume(vol)
 		channel:SetPlaybackRate(channelData.playbackRate)
@@ -770,7 +811,7 @@ function AudioSystem.PlayBackgroundMusic(fileName)
 		channel:EnableLooping(true)
 		channel:SetTime(AudioSystem.GetBackgroundMusicTime())
 		channel:SetPlaybackRate(AudioSystem.GetBackgroundMusicPlaybackRate())
-		AudioSystem.FadeToVolume(channel, 3, AudioSystem.GetBackgroundMusicVolume())
+		AudioSystem.FadeToVolume(channel, 3, AudioSystem.GetBackgroundMusicVolumeControlled())
 	end)
 end
 
@@ -804,6 +845,18 @@ local function OnBackgroundMusicPlaybackRateChange(ent, name, old, new)
 	end
 end
 
+-- Similar to GetBackgroundMusicVolume BUT in the lobby it's bound to snd_musicvolume -> The GMod Settings Music volume slider
+local snd_musicvolume = GetConVar("snd_musicvolume")
+function AudioSystem.GetBackgroundMusicVolumeControlled(fallBack)
+	local volume = AudioSystem.GetBackgroundMusicVolume(fallBack)
+
+	if GameData and GameData.IsLobby then
+		volume = volume * snd_musicvolume:GetFloat()
+	end
+
+	return volume
+end
+
 function AudioSystem.Init()
 	local world = game.GetWorld()
 
@@ -822,7 +875,7 @@ function AudioSystem.Init()
 	OnBackgroundMusicStateChange(world, "AudioSystem:ShouldPlayBackgroundMusic", nil, AudioSystem.ShouldPlayBackgroundMusic())
 
 	world:SetNW2VarProxy("AudioSystem:BackgroundMusicVolume", OnBackgroundMusicVolumeChange)
-	OnBackgroundMusicVolumeChange(world, "AudioSystem:BackgroundMusicVolume", nil, AudioSystem.GetBackgroundMusicVolume())
+	OnBackgroundMusicVolumeChange(world, "AudioSystem:BackgroundMusicVolume", nil, AudioSystem.GetBackgroundMusicVolumeControlled())
 
 	world:SetNW2VarProxy("AudioSystem:BackgroundMusicPlaybackRate", OnBackgroundMusicPlaybackRateChange)
 	OnBackgroundMusicPlaybackRateChange(world, "AudioSystem:BackgroundMusicPlaybackRate", nil, AudioSystem.GetBackgroundMusicPlaybackRate())
@@ -841,6 +894,14 @@ local function UpdateBackgroundMusic()
 	else
 		if AudioSystem.BackgroundChannel:GetState() ~= GMOD_CHANNEL_PLAYING then -- Fk stopsound
 			AudioSystem.BackgroundChannel:Play()
+		end
+
+		local muteState = ShouldMuteVolue()
+		if muteState == MuteState.MUTED then
+			AudioSystem.BackgroundChannel:SetVolume(0)
+			return
+		elseif muteState == MuteState.WAS_MUTED then
+			AudioSystem.BackgroundChannel:SetVolume(AudioSystem.GetBackgroundMusicVolumeControlled())
 		end
 
 		local backgroundMusicTime = AudioSystem.GetBackgroundMusicTime()
@@ -908,6 +969,14 @@ local function UpdateChannelPositionAndVolume(channel, channelData, localPlyPos)
 		channel:SetPos(channelData.pos)
 	end
 end
+
+cvars.AddChangeCallback("snd_musicvolume", function(_, _, newValue)
+	if not IsValid(AudioSystem.BackgroundChannel) then return end
+
+	local channel = AudioSystem.BackgroundChannel
+	local channelData = AudioSystem.Channels[channel]
+	channel:SetVolume(CalculateChannelVolume(channel, AudioSystem.GetBackgroundMusicVolumeControlled()))
+end)
 
 local function UpdateChannelPositionsAndVolumes()
 	local localPlyPos = GetLocalPlayerPosition()
@@ -1033,7 +1102,7 @@ end)
 		number pan - The sound pan - See https://wiki.facepunch.com/gmod/IGModAudioChannel:SetPan
 		number playbackRate - The sound playback rate.
 		boolean noplay - Won't automatically play the sound
-		string group - If set, a hook is called allowing you to add a hook that is executed when a sound is played like this: hook.Add("AudioSYstem:AudioSystem:PlaySound:ExampleGroup", "Example", function(soundData, channel))
+		string group - If set, a hook is called allowing you to add a hook that is executed when a sound is played like this: hook.Add("AudioSystem:PlaySound:ExampleGroup", "Example", function(soundData, channel))
 		boolean deleteWhenDone - If true, the channel is deleted once the sound finished playing (will ignore looping flag and still stop it).
 		number fadeIn - How many seconds it takes for the song to fade in at the start of it.
 		number fadeOut - How many seconds before the ending it should start to fade out, and when it faded out the channel is destroyed.
@@ -1074,7 +1143,7 @@ function AudioSystem.PlaySound(soundData)
 	local soundPath = soundData.soundPath
 	if soundData.boundConVar and soundData.fallbackSoundPath then
 		local convar = GetConVar(soundData.boundConVar)
-		if not convar:GetBool() then
+		if IsValid(convar) and not convar:GetBool() then
 			soundPath = soundData.fallbackSoundPath
 		end
 	end
@@ -1091,10 +1160,12 @@ function AudioSystem.PlaySound(soundData)
 		entIndex = soundData.entity
 	elseif IsValid(soundData.entity) then
 		entIndex = soundData.entity:EntIndex() -- ToDo: Should we also support clientside entities? Probably.
+	else
+		soundData.disableUniqueToEntity = true
 	end
 
 	if not soundData.disableUniqueToEntity then
-		soundData.identifier = soundData.identifier .. entIndex
+		soundData.identifier = soundData.identifier .. "_ENT_" .. entIndex
 	end
 
 	AudioSystem.StopSound(soundData.identifier, 0.5)
@@ -1150,7 +1221,10 @@ function AudioSystem.PlaySound(soundData)
 			channel:SetVolume(0)
 			channelData.volume = 0
 		else
-			channel:SetVolume(soundData.volume)
+			if ShouldMuteVolue() ~= MuteState.MUTED then
+				channel:SetVolume(soundData.volume)
+			end
+			channelData.volume = soundData.volume
 		end
 
 		channel:EnableLooping(soundData.looping)
@@ -1172,10 +1246,9 @@ function AudioSystem.PlaySound(soundData)
 		end
 
 		if soundData.position then
+			channelData.pos = soundData.position
 			if channelData.is3D then
 				channel:SetPos(soundData.position)
-			else
-				channelData.pos = soundData.position
 			end
 		end
 
@@ -1221,10 +1294,10 @@ function AudioSystem.PlaySound(soundData)
 		end
 
 		if soundData.group then -- This will be useful later when adding perks that modify the sound of things
-			hook.Run("AudioSystem:AudioSystem:PlaySound:" .. soundData.group, soundData, channel)
+			hook.Run("AudioSystem:PlaySound:" .. soundData.group, soundData, channel)
 		end
 
-		if soundData.deleteWhenDone then
+		if soundData.deleteWhenDone and not soundData.looping then
 			timer.Simple(timeLeft + 0.1, function()
 				if not IsValid(channel) then return end
 				AudioSystem.DestroyChannel(channel, 0)
@@ -1313,13 +1386,13 @@ function AudioSystem.StopSound(identifier, fadeOut, entIndex)
 	end
 
 	-- We use or and do identifier .. entIndex since if a sound didn't use disableUniqueToEntity, it will append the EntIndex to our identifier
-	local creationSounData = AudioSystem.CreatingChannels[identifier] or AudioSystem.CreatingChannels[identifier .. (entIndex or "")]
+	local creationSounData = AudioSystem.CreatingChannels[identifier] or AudioSystem.CreatingChannels[identifier .. "_ENT_" .. (entIndex or "")]
 	if creationSounData then -- The channel wasn't created yet, so we cannot stop it. Instead we'll set a flag.
 		creationSounData.DESTROYCHANNEL = true
 		return
 	end
 
-	local channel = AudioSystem.GetChannelByIdentifier(identifier) or AudioSystem.GetChannelByIdentifier(identifier .. (entIndex or ""))
+	local channel = AudioSystem.GetChannelByIdentifier(identifier) or AudioSystem.GetChannelByIdentifier(identifier .. "_ENT_" .. (entIndex or ""))
 	if not channel then return end
 
 	AudioSystem.DestroyChannel(channel, fadeOut)
@@ -1436,9 +1509,87 @@ net.Receive("AudioSystem_MissingDelta", function()
 	PlayServerReceivedSound(soundData)
 end)
 
-net.Receive("AudioSystem_PlaySound", function()
-	local isDelta = net.ReadBool()
-	local soundData = ReadSoundData()
+
+local NetworkSettings = { -- This table MUST be the same on the client
+	PlaySound = {
+		ID = 1,
+		ReadFunc = nil, -- only used clientside
+		ProcessFunc = nil, -- on the server this is used to SEND data- on the client it's used to process data read by ReadFunc
+	},
+	StopSound = {
+		ID = 2,
+		ReadFunc = nil,
+		ProcessFunc = nil,
+	},
+	EntityRemoved = {
+		ID = 3,
+		ReadFunc = nil,
+		ProcessFunc = nil,
+	},
+	SetGroupVolume = {
+		ID = 4,
+		ReadFunc = nil,
+		ProcessFunc = nil,
+	},
+	FadeSound = {
+		ID = 5,
+		ReadFunc = nil,
+		ProcessFunc = nil,
+	},
+	_ID_BITS = 3, -- max 7
+	_COUNT_BITS = 9, -- max 511 updates per transmit
+
+	-- Sends out an upate every time containing all updates from the last acknowledged tick
+	-- if false it sends the message as reliable once and is done
+	-- This makes a noticable difference in higher ping conditions & packet loss
+	-- as it can network sounds way faster staying in sync with entity updates.
+	_UNRELIABLE = true,
+}
+for key, data in pairs(NetworkSettings) do -- Add NetworkSettings[ID] entries for easy lookup
+	if istable(data) and data.ID then
+		NetworkSettings[data.ID] = data
+		data.Name = key
+	end
+end
+
+net.Receive("AudioSystem_Update", function()
+	local sendTick = net.ReadUInt(32)
+	local count = net.ReadUInt(NetworkSettings._COUNT_BITS)
+	for k=1, count do
+		local tick = net.ReadUInt(32)
+		local type = net.ReadUInt(NetworkSettings._ID_BITS)
+		local typeData = NetworkSettings[type]
+
+		if not typeData or not typeData.ReadFunc or not typeData.ProcessFunc then
+			ErrorNoHaltWithStack("Invalid type? (" .. type .. ", " .. ((typeData and typeData.Name) or "Unknown") .. ")")
+			return
+		end
+
+		local readData = typeData.ReadFunc()
+
+		-- If we receive an old tick or duplicate we skip since we already processed it.
+		if tick <= AudioSystem.LastAcknowledgedTick then continue end
+
+		typeData.ProcessFunc(readData)
+	end
+
+	AudioSystem.LastAcknowledgedTick = sendTick
+
+	net.Start("AudioSystem_Acknowledge", NetworkSettings._UNRELIABLE)
+		net.WriteUInt(sendTick, 32)
+	net.SendToServer()
+end)
+
+function NetworkSettings.PlaySound.ReadFunc()
+	return {
+		isDelta = net.ReadBool(),
+		soundData = ReadSoundData(),
+	}
+end
+
+function NetworkSettings.PlaySound.ProcessFunc(data)
+	local isDelta = data.isDelta
+	local soundData = data.soundData
 	local identifier = soundData.identifier or soundData.soundPath
 	if isDelta then
 		local baseTable = AudioSystem.DeltaSoundCache[identifier]
@@ -1467,40 +1618,54 @@ net.Receive("AudioSystem_PlaySound", function()
 
 	-- PrintTable(soundData)
 	PlayServerReceivedSound(soundData)
-end)
+end
 
-net.Receive("AudioSystem_StopSound", function()
-	local identifier = ReadSoundField(net.ReadString)
-	local fadeOut = net.ReadFloat()
-	local entIndex = ReadSoundField(net.ReadUInt, MAX_EDICT_BITS)
+function NetworkSettings.StopSound.ReadFunc()
+	return {
+		identifier = ReadSoundField(net.ReadString),
+		fadeOut = net.ReadFloat(),
+		entIndex = ReadSoundField(net.ReadUInt, MAX_EDICT_BITS),
+	}
+end
 
-	AudioSystem.StopSound(identifier, fadeOut, entIndex)
-end)
+function NetworkSettings.StopSound.ProcessFunc(data)
+	AudioSystem.StopSound(data.identifier, data.fadeOut, data.entIndex)
+end
 
-net.Receive("AudioSystem_FadeSound", function() -- ToDo: Fix this function
-	local identifier = net.ReadString()
-	local fadeTime = net.ReadFloat()
-	local targetVolume = net.ReadFloat()
+function NetworkSettings.FadeSound.ReadFunc()
+	return {
+		identifier = net.ReadString(),
+		fadeTime = net.ReadFloat(),
+		targetVolume = net.ReadFloat(),
+	}
+end
 
-	local channel = AudioSystem.GetChannelByIdentifier(identifier)
+function NetworkSettings.FadeSound.ProcessFunc(data)
+	local channel = AudioSystem.GetChannelByIdentifier(data.identifier)
 	if not channel then return end
 
-	AudioSystem.FadeToVolume(channel, fadeTime, targetVolume)
-end)
+	AudioSystem.FadeToVolume(channel, data.fadeTime, data.targetVolume)
+end
 
-net.Receive("AudioSystem_EntityRemoved", function()
-	local entIndex = net.ReadUInt(MAX_EDICT_BITS)
+function NetworkSettings.EntityRemoved.ReadFunc()
+	return net.ReadUInt(MAX_EDICT_BITS)
+end
 
+function NetworkSettings.EntityRemoved.ProcessFunc(entIndex)
 	AudioSystem.StopSound(nil, 1, entIndex)
-end)
+end
 
-net.Receive("AudioSystem_SetGroupVolume", function()
-	local groupName = net.ReadString()
-	local groupVolume = net.ReadFloat()
-	local lerpTime = net.ReadFloat() -- ToDo
+function NetworkSettings.SetGroupVolume.ReadFunc()
+	return {
+		groupName = net.ReadString(),
+		groupVolume = net.ReadFloat(),
+		lerpTime = net.ReadFloat(), -- ToDo
+	}
+end
 
-	AudioSystem.ServerGroupVolumes[groupName] = groupVolume
-end)
+function NetworkSettings.SetGroupVolume.ProcessFunc(data)
+	AudioSystem.ServerGroupVolumes[data.groupName] = data.groupVolume
+end
 
 function AudioSystem.SetGroupVolume(groupName, groupVolume, lerpTime)
 	AudioSystem.ClientGroupVolumes[groupName] = groupVolume

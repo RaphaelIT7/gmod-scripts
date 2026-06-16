@@ -25,10 +25,6 @@ function AudioSystem.ShouldPlayBackgroundMusic()
 	return GetGlobal2Bool("AudioSystem:ShouldPlayBackgroundMusic", false)
 end
 
-function AudioSystem.EnableBackgroundMusic()
-	SetGlobal2Bool("AudioSystem:ShouldPlayBackgroundMusic", true)
-end
-
 function AudioSystem.EnableBackgroundMusic(forced)
 	if forced then
 		AudioSystem.ForcedDisable = false
@@ -127,6 +123,26 @@ function AudioSystem.TimeToTick(time, baseTick)
 	end
 
 	return baseTick - tickTime
+end
+
+-- Looks up a sound by name registered using sound.Add and select one of its sound files randomly
+function AudioSystem.GetSoundFileFromSource(name)
+	local info = sound.GetProperties(name)
+	if not info then return end
+	if not info.sound then return end
+
+	local soundFile = nil
+	if isstring(info.sound) then
+		soundFile = info.sound
+	end
+
+	if istable(info.sound) then
+		soundFile = info.sound[math.random(1, #info.sound)]
+	end
+	
+	if soundFile then
+		return (soundFile:StartsWith("(") or soundFile:StartsWith(")")) and soundFile:sub(2) or soundFile
+	end
 end
 
 -- Server & client files are loaded at last

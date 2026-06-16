@@ -1,11 +1,87 @@
---[[
-	ToDo: Implemement ambient music system
-]]
+local weakMeta = {
+	__mode = "k",
+}
 
 -- This table contains all tables that were played, this was done to support full updates properly later on. Currently Unused.
 AudioSystem.Sounds = AudioSystem.Sounds or {}
 AudioSystem.DeltaSoundCache = AudioSystem.DeltaSoundCache or {}
 AudioSystem.PlayerDeltaSoundCache = AudioSystem.PlayerDeltaSoundCache or {}
+AudioSystem.TransmitData = AudioSystem.TransmitData or {}
+
+setmetatable(AudioSystem.PlayerDeltaSoundCache, weakMeta)
+setmetatable(AudioSystem.TransmitData, weakMeta)
+
+local NetworkSettings = { -- This table MUST be the same on the client
+	PlaySound = {
+		ID = 1,
+		ReadFunc = nil, -- only used clientside
+		ProcessFunc = nil, -- on the server this is used to SEND data- on the client it's used to process data read by ReadFunc
+	},
+	StopSound = {
+		ID = 2,
+		ReadFunc = nil,
+		ProcessFunc = nil,
+	},
+	EntityRemoved = {
+		ID = 3,
+		ReadFunc = nil,
+		ProcessFunc = nil,
+	},
+	SetGroupVolume = {
+		ID = 4,
+		ReadFunc = nil,
+		ProcessFunc = nil,
+	},
+	FadeSound = {
+		ID = 5,
+		ReadFunc = nil,
+		ProcessFunc = nil,
+	},
+	_ID_BITS = 3, -- max 7
+	_COUNT_BITS = 9, -- max 511 updates per transmit
+
+	-- Sends out an upate every time containing all updates from the last acknowledged tick
+	-- if false it sends the message as reliable once and is done
+	-- This makes a noticable difference in higher ping conditions & packet loss
+	-- as it can network sounds way faster staying in sync with entity updates.
+	_UNRELIABLE = true,
+}
+
+local function AddToTransmit(ply, type, data)
+	local transmitData = AudioSystem.TransmitData[ply]
+	if not transmitData then
+		transmitData = {
+			pending = {}
+		}
+		AudioSystem.TransmitData[ply] = transmitData
+	end
+
+	table.insert(transmitData.pending, {
+		type = type,
+		data = data,
+		tick = engine.TickCount()
+	})
+end
+
+local function AddToTransmits(sendToEntity, type, data)
+	if not sendToEntity then
+		for _, ply in player.Iterator() do
+			AddToTransmit(ply, type, data)
+		end
+	else
+		if isnumber(sendToEntity) and team.Valid(sendToEntity) then
+			sendToEntity = team.GetPlayers(sendToEntity)
+		end
+
+		if istable(sendToEntity) then
+			for _, ply in ipairs(sendToEntity) do
+				AddToTransmit(ply, type, data)
+			end
+		elseif IsEntity(sendToEntity) and IsValid(sendToEntity) and sendToEntity:IsPlayer() then
+			AddToTransmit(sendToEntity, type, data)
+		end
+	end
+end
 
 -- Needed since WriteSoundField else wouldn't work.
 -- ToDo: Why do we even use the EntIndex and not the Entity handle?
@@ -26,12 +102,6 @@ local function WriteSoundField(value, writeFunc, ...)
 	end
 end
 
-local function WritePulseEffect(table)
-	WriteSoundField(table.entity, WriteEntIndex)
-	WriteSoundField(table.entityClass, net.WriteString)
-	WriteSoundField(table.frequency, net.ReadUInt, 16)
-end
-
 local function WriteDeltaSoundField(value, deltaValue, writeFunc, ...)
 	local isNil = value == nil or value == deltaValue
 	net.WriteBool(isNil)
@@ -41,109 +111,99 @@ local function WriteDeltaSoundField(value, deltaValue, writeFunc, ...)
 	end
 end
 
+local function WritePulseEffect(table)
+	WriteSoundField(table.entity, WriteEntIndex)
+	WriteSoundField(table.entityClass, net.WriteString)
+	WriteSoundField(table.frequency, net.ReadUInt, 16)
+end
+
 local function WriteDeltaPulseEffect(table, deltaTable)
 	WriteDeltaSoundField(table.entity, (deltaTable and deltaTable.entity or nil), WriteEntIndex)
 	WriteDeltaSoundField(table.entityClass, (deltaTable and deltaTable.entityClass or nil), net.WriteString)
 	WriteDeltaSoundField(table.frequency, (deltaTable and deltaTable.frequency or nil), net.ReadUInt, 16)
 end
 
-local function SendToPlayersWithDelta(playerList, soundData, deltaList)
+local function SendToPlayersWithDelta(soundData, deltaList)
 	local identifier = soundData.identifier or soundData.soundPath
-	net.Start("AudioSystem_PlaySound", soundData.unreliable or false)
-		net.WriteBool(true)
-		if soundData.soundPath == identifier then -- We cannot apply delta to the soundPath if it's the delta identifier!
-			WriteSoundField(soundData.soundPath, net.WriteString)
-		else
-			WriteDeltaSoundField(soundData.soundPath, deltaList.soundPath, net.WriteString)
-		end
-		WriteDeltaSoundField(soundData.fallbackSoundPath, deltaList.fallbackSoundPath, net.WriteString)
-		WriteDeltaSoundField(soundData.entity, deltaList.entity, WriteEntIndex)
-		WriteDeltaSoundField(soundData.soundLevel, deltaList.soundLevel, net.WriteUInt, 14)
-		WriteDeltaSoundField(soundData.volume, deltaList.volume, net.WriteFloat)
-		WriteDeltaSoundField(soundData.looping, deltaList.looping, net.WriteBool)
-		WriteDeltaSoundField(soundData.startTick, deltaList.startTick, net.WriteUInt, 32)
-		if soundData.identifier == identifier then -- We cannot apply delta to the identifier if it's the delta identifier!
-			WriteSoundField(soundData.identifier, net.WriteString)
-		else
-			WriteDeltaSoundField(soundData.identifier, deltaList.identifier, net.WriteString)
-		end
-		WriteDeltaSoundField(soundData.minDistance, deltaList.minDistance, net.WriteUInt, 16)
-		WriteDeltaSoundField(soundData.maxDistance, deltaList.maxDistance, net.WriteUInt, 16)
-		WriteDeltaSoundField(soundData.startDistance, deltaList.startDistance, net.WriteUInt, 16)
-		WriteDeltaSoundField(soundData.startEndDistance, deltaList.startEndDistance, net.WriteUInt, 16)
-		WriteDeltaSoundField(soundData.position, deltaList.position, net.WriteVector)
-		WriteDeltaSoundField(soundData.modes, deltaList.modes, net.WriteString)
-		WriteDeltaSoundField(soundData.pan, deltaList.pan, net.WriteFloat)
-		WriteDeltaSoundField(soundData.playbackRate, deltaList.playbackRate, net.WriteFloat)
-		WriteDeltaSoundField(soundData.group, deltaList.group, net.WriteString)
-		WriteDeltaSoundField(soundData.deleteWhenDone, deltaList.deleteWhenDone, net.WriteBool)
-		WriteDeltaSoundField(soundData.fadeIn, deltaList.fadeIn, net.WriteFloat)
-		WriteDeltaSoundField(soundData.fadeOut, deltaList.fadeOut, net.WriteFloat)
-		WriteDeltaSoundField(soundData.fadeOutStart, deltaList.fadeOutStart, net.WriteFloat)
-		WriteDeltaSoundField(soundData.forceMono, deltaList.forceMono, net.WriteBool)
-		WriteDeltaSoundField(soundData.forceStereo, deltaList.forceStereo, net.WriteBool)
-		WriteDeltaSoundField(soundData.noWorldSpace, deltaList.noWorldSpace, net.WriteBool)
-		WriteDeltaSoundField(soundData.dynamicPan, deltaList.dynamicPan, net.WriteBool)
-		WriteDeltaSoundField(soundData.boundConVar, deltaList.boundConVar, net.WriteString)
-		WriteDeltaSoundField(soundData.pulseEffect, deltaList.pulseEffect, WriteDeltaPulseEffect)
-		WriteDeltaSoundField(soundData.disableUniqueToEntity, deltaList.disableUniqueToEntity, net.WriteBool)
-		WriteDeltaSoundField(soundData.raytraced, deltaList.raytraced, net.WriteBool)
-		WriteDeltaSoundField(soundData.modifyGroup, deltaList.modifyGroup, net.WriteString)
-		WriteDeltaSoundField(soundData.modifyGroupVolumeMult, deltaList.modifyGroupVolumeMult, net.WriteFloat)
-		WriteDeltaSoundField(soundData.modifyGroupVolumeFadeTime, deltaList.modifyGroupVolumeFadeTime, net.WriteFloat)
-		-- NOTE: We don't network the field noplay since we expect networked sounds to always play instantly based on how we currently use it.
-	if not playerList then
-		net.Broadcast()
+	net.WriteBool(true)
+	if soundData.soundPath == identifier then -- We cannot apply delta to the soundPath if it's the delta identifier!
+		WriteSoundField(soundData.soundPath, net.WriteString)
 	else
-		net.Send(playerList)
+		WriteDeltaSoundField(soundData.soundPath, deltaList.soundPath, net.WriteString)
 	end
+	WriteDeltaSoundField(soundData.fallbackSoundPath, deltaList.fallbackSoundPath, net.WriteString)
+	WriteDeltaSoundField(soundData.entity, deltaList.entity, WriteEntIndex)
+	WriteDeltaSoundField(soundData.soundLevel, deltaList.soundLevel, net.WriteUInt, 14)
+	WriteDeltaSoundField(soundData.volume, deltaList.volume, net.WriteFloat)
+	WriteDeltaSoundField(soundData.looping, deltaList.looping, net.WriteBool)
+	WriteDeltaSoundField(soundData.startTick, deltaList.startTick, net.WriteUInt, 32)
+	if soundData.identifier == identifier then -- We cannot apply delta to the identifier if it's the delta identifier!
+		WriteSoundField(soundData.identifier, net.WriteString)
+	else
+		WriteDeltaSoundField(soundData.identifier, deltaList.identifier, net.WriteString)
+	end
+	WriteDeltaSoundField(soundData.minDistance, deltaList.minDistance, net.WriteUInt, 16)
+	WriteDeltaSoundField(soundData.maxDistance, deltaList.maxDistance, net.WriteUInt, 16)
+	WriteDeltaSoundField(soundData.startDistance, deltaList.startDistance, net.WriteUInt, 16)
+	WriteDeltaSoundField(soundData.startEndDistance, deltaList.startEndDistance, net.WriteUInt, 16)
+	WriteDeltaSoundField(soundData.position, deltaList.position, net.WriteVector)
+	WriteDeltaSoundField(soundData.modes, deltaList.modes, net.WriteString)
+	WriteDeltaSoundField(soundData.pan, deltaList.pan, net.WriteFloat)
+	WriteDeltaSoundField(soundData.playbackRate, deltaList.playbackRate, net.WriteFloat)
+	WriteDeltaSoundField(soundData.group, deltaList.group, net.WriteString)
+	WriteDeltaSoundField(soundData.deleteWhenDone, deltaList.deleteWhenDone, net.WriteBool)
+	WriteDeltaSoundField(soundData.fadeIn, deltaList.fadeIn, net.WriteFloat)
+	WriteDeltaSoundField(soundData.fadeOut, deltaList.fadeOut, net.WriteFloat)
+	WriteDeltaSoundField(soundData.fadeOutStart, deltaList.fadeOutStart, net.WriteFloat)
+	WriteDeltaSoundField(soundData.forceMono, deltaList.forceMono, net.WriteBool)
+	WriteDeltaSoundField(soundData.forceStereo, deltaList.forceStereo, net.WriteBool)
+	WriteDeltaSoundField(soundData.noWorldSpace, deltaList.noWorldSpace, net.WriteBool)
+	WriteDeltaSoundField(soundData.dynamicPan, deltaList.dynamicPan, net.WriteBool)
+	WriteDeltaSoundField(soundData.boundConVar, deltaList.boundConVar, net.WriteString)
+	WriteDeltaSoundField(soundData.pulseEffect, deltaList.pulseEffect, WriteDeltaPulseEffect)
+	WriteDeltaSoundField(soundData.disableUniqueToEntity, deltaList.disableUniqueToEntity, net.WriteBool)
+	WriteDeltaSoundField(soundData.raytraced, deltaList.raytraced, net.WriteBool)
+	WriteDeltaSoundField(soundData.modifyGroup, deltaList.modifyGroup, net.WriteString)
+	WriteDeltaSoundField(soundData.modifyGroupVolumeMult, deltaList.modifyGroupVolumeMult, net.WriteFloat)
+	WriteDeltaSoundField(soundData.modifyGroupVolumeFadeTime, deltaList.modifyGroupVolumeFadeTime, net.WriteFloat)
+	-- NOTE: We don't network the field noplay since we expect networked sounds to always play instantly based on how we currently use it.
 end
 
-local function SendToPlayersWithNoDelta(playerList, soundData, manualSend)
-	if not manualSend then -- In case we are calling this for delta recovery
-		net.Start("AudioSystem_PlaySound", soundData.unreliable or false)
-			net.WriteBool(false)
-	end
-
-		WriteSoundField(soundData.soundPath, net.WriteString)
-		WriteSoundField(soundData.fallbackSoundPath, net.WriteString)
-		WriteSoundField(soundData.entity, WriteEntIndex)
-		WriteSoundField(soundData.soundLevel, net.WriteUInt, 14)
-		WriteSoundField(soundData.volume, net.WriteFloat)
-		WriteSoundField(soundData.looping, net.WriteBool)
-		WriteSoundField(soundData.startTick, net.WriteUInt, 32)
-		WriteSoundField(soundData.identifier, net.WriteString)
-		WriteSoundField(soundData.minDistance, net.WriteUInt, 16)
-		WriteSoundField(soundData.maxDistance, net.WriteUInt, 16)
-		WriteSoundField(soundData.startDistance, net.WriteUInt, 16)
-		WriteSoundField(soundData.startEndDistance, net.WriteUInt, 16)
-		WriteSoundField(soundData.position, net.WriteVector)
-		WriteSoundField(soundData.modes, net.WriteString)
-		WriteSoundField(soundData.pan, net.WriteFloat)
-		WriteSoundField(soundData.playbackRate, net.WriteFloat)
-		WriteSoundField(soundData.group, net.WriteString)
-		WriteSoundField(soundData.deleteWhenDone, net.WriteBool)
-		WriteSoundField(soundData.fadeIn, net.WriteFloat)
-		WriteSoundField(soundData.fadeOut, net.WriteFloat)
-		WriteSoundField(soundData.fadeOutStart, net.WriteFloat)
-		WriteSoundField(soundData.forceMono, net.WriteBool)
-		WriteSoundField(soundData.forceStereo, net.WriteBool)
-		WriteSoundField(soundData.noWorldSpace, net.WriteBool)
-		WriteSoundField(soundData.dynamicPan, net.WriteBool)
-		WriteSoundField(soundData.boundConVar, net.WriteString)
-		WriteSoundField(soundData.pulseEffect, WritePulseEffect)
-		WriteSoundField(soundData.disableUniqueToEntity, net.WriteBool)
-		WriteSoundField(soundData.raytraced, net.WriteBool)
-		WriteSoundField(soundData.modifyGroup, net.WriteString)
-		WriteSoundField(soundData.modifyGroupVolumeMult, net.WriteFloat)
-		WriteSoundField(soundData.modifyGroupVolumeFadeTime, net.WriteFloat)
-		-- NOTE: We don't network the field noplay since we expect networked sounds to always play instantly based on how we currently use it.
-	if manualSend then return end
-	if not playerList then
-		net.Broadcast()
-	else
-		net.Send(playerList)
-	end
+local function SendToPlayersWithNoDelta(soundData, manualSend)
+	net.WriteBool(false)
+	WriteSoundField(soundData.soundPath, net.WriteString)
+	WriteSoundField(soundData.fallbackSoundPath, net.WriteString)
+	WriteSoundField(soundData.entity, WriteEntIndex)
+	WriteSoundField(soundData.soundLevel, net.WriteUInt, 14)
+	WriteSoundField(soundData.volume, net.WriteFloat)
+	WriteSoundField(soundData.looping, net.WriteBool)
+	WriteSoundField(soundData.startTick, net.WriteUInt, 32)
+	WriteSoundField(soundData.identifier, net.WriteString)
+	WriteSoundField(soundData.minDistance, net.WriteUInt, 16)
+	WriteSoundField(soundData.maxDistance, net.WriteUInt, 16)
+	WriteSoundField(soundData.startDistance, net.WriteUInt, 16)
+	WriteSoundField(soundData.startEndDistance, net.WriteUInt, 16)
+	WriteSoundField(soundData.position, net.WriteVector)
+	WriteSoundField(soundData.modes, net.WriteString)
+	WriteSoundField(soundData.pan, net.WriteFloat)
+	WriteSoundField(soundData.playbackRate, net.WriteFloat)
+	WriteSoundField(soundData.group, net.WriteString)
+	WriteSoundField(soundData.deleteWhenDone, net.WriteBool)
+	WriteSoundField(soundData.fadeIn, net.WriteFloat)
+	WriteSoundField(soundData.fadeOut, net.WriteFloat)
+	WriteSoundField(soundData.fadeOutStart, net.WriteFloat)
+	WriteSoundField(soundData.forceMono, net.WriteBool)
+	WriteSoundField(soundData.forceStereo, net.WriteBool)
+	WriteSoundField(soundData.noWorldSpace, net.WriteBool)
+	WriteSoundField(soundData.dynamicPan, net.WriteBool)
+	WriteSoundField(soundData.boundConVar, net.WriteString)
+	WriteSoundField(soundData.pulseEffect, WritePulseEffect)
+	WriteSoundField(soundData.disableUniqueToEntity, net.WriteBool)
+	WriteSoundField(soundData.raytraced, net.WriteBool)
+	WriteSoundField(soundData.modifyGroup, net.WriteString)
+	WriteSoundField(soundData.modifyGroupVolumeMult, net.WriteFloat)
+	WriteSoundField(soundData.modifyGroupVolumeFadeTime, net.WriteFloat)
+	-- NOTE: We don't network the field noplay since we expect networked sounds to always play instantly based on how we currently use it.
 end
 
 local deltaMerge
@@ -166,6 +226,7 @@ deltaMerge = DeltaMerge
 	Serverside only fields:
 		number sendToTeam - Sends the given sound only to the specific team
 		Entity/Table sendToEntity - Sends the given sound only to a specific player/table of players
+		table langPaths - A table where key is the language like "en", "de", "ru" and value is a path to a sound file. It overrides soundData.soundPath with the right language sound file!
 ]]
 util.AddNetworkString("AudioSystem_PlaySound")
 function AudioSystem.PlaySound(soundData) -- see cl_audiosystem.lua for documentation of the table.
@@ -175,6 +236,15 @@ function AudioSystem.PlaySound(soundData) -- see cl_audiosystem.lua for document
 
 	if not isstring(soundData.soundPath) then -- the only requirement that exists.
 		error("PlaySound: Missing soundPath field!")
+	end
+
+	if not soundData.entity then -- Falls back onto the world as a global sound!
+		soundData.entity = 0
+		soundData.disableUniqueToEntity = true
+
+		if not soundData.position then
+			soundData.forceStereo = true
+		end
 	end
 
 	-- Fallback code to ensure that if an entity wasn't networked to a client yet,
@@ -197,62 +267,40 @@ function AudioSystem.PlaySound(soundData) -- see cl_audiosystem.lua for document
 
 	local identifier = soundData.identifier or soundData.soundPath
 	local deltaTable = AudioSystem.DeltaSoundCache[identifier]
-	if deltaTable then
-		local deltaPlayers = {}
-		local revDeltaPlayers = {}
-		local targetPlayers = {}
-		if IsEntity(soundData.sendToEntity) then
-			local deltaList = AudioSystem.PlayerDeltaSoundCache[soundData.sendToEntity]
-			if deltaList and deltaList[identifier] then
-				table.insert(deltaList, soundData.sendToEntity)
 
-				table.insert(deltaPlayers, soundData.sendToEntity)
-				revDeltaPlayers[soundData.sendToEntity] = true
-			end
-		else
-			if istable(soundData.sendToEntity) then
-				for k, ply in ipairs(soundData.sendToEntity) do
-					targetPlayers[ply] = true
-					targetPlayers[k] = ply
-				end
-			else
-				for k, ply in player.Iterator() do
-					targetPlayers[ply] = true
-					targetPlayers[k] = ply
-				end
-			end
+	local data = {
+		identifier = identifier,
+		deltaTable = deltaTable,
+		soundData = soundData,
+	}
 
-			for ply, deltaList in pairs(AudioSystem.PlayerDeltaSoundCache) do
-				if not IsValid(ply) then
-					AudioSystem.PlayerDeltaSoundCache[ply] = nil -- Yes, this is how we'll clean it.
-					continue
-				end
+	AddToTransmits(soundData.sendToEntity, NetworkSettings.PlaySound, data)
+end
 
-				if targetPlayers[ply] and deltaList[identifier] then
-					-- print("Added for delta update " .. ply:Name())
-					table.insert(deltaPlayers, ply)
-					revDeltaPlayers[ply] = true
-				end
-			end
+function NetworkSettings.PlaySound.ProcessFunc(data, ply)
+	local identifier = data.identifier
+	local soundData = data.soundData
+	local deltaTable = data.deltaTable -- if we had no data when PlaySound was called we do not want to check here for delta.
+	local plyDeltaTable = AudioSystem.PlayerDeltaSoundCache[ply]
+	-- We must do this here since else delta sending will be messed up!
+	local originalSoundPath = soundData.soundPath
+	if soundData.langPaths then
+		local clientLang = ply:GetInfo("gmod_language")
+		local soundPath = soundData.langPaths[clientLang]
+		if soundPath then
+			soundData.soundPath = soundPath
 		end
+	end
 
-		SendToPlayersWithDelta(deltaPlayers, soundData, deltaTable)
-
-		local noDeltaPlayers = {}
-		for _, ply in ipairs(targetPlayers) do
-			if revDeltaPlayers[ply] then continue end
-
-			table.insert(noDeltaPlayers, ply)
-		end
-
-		if #noDeltaPlayers > 0 then
-			-- print("We had no delta for " .. #noDeltaPlayers)
-			SendToPlayersWithNoDelta(noDeltaPlayers, soundData)
-		end
+	if deltaTable and plyDeltaTable and plyDeltaTable[identifier] then
+		SendToPlayersWithDelta(soundData, deltaTable)
 	else
-		SendToPlayersWithNoDelta(soundData.sendToEntity, soundData)
+		SendToPlayersWithNoDelta(soundData)
 		deltaTable = {}
 		-- print("We had no delta :sob:")
+
+		-- We restore it to not break delta later on!
+		soundData.soundPath = originalSoundPath
 
 		-- Yes, this is not the best way, we should probably ALWAYS update the delta though I don't like that idea really as then delta recover gets tricky.
 		-- Also really only position & entity fields should change.
@@ -260,44 +308,100 @@ function AudioSystem.PlaySound(soundData) -- see cl_audiosystem.lua for document
 	
 		AudioSystem.DeltaSoundCache[identifier] = deltaTable
 	end
-
-	--[[table.insert(AudioSystem.Sounds, {
-		filePath = soundPath,
-		level = soundLevel,
-		ent = ent:EntIndex(),
-		volume = vol,
-		permanent = permanent,
-		startTime = CurTime()
-	})]]
 end
+
+-- We use SetupPlayerVisibility as it's called, ONCE per transmit / entity update
+-- So every time the engine sends out a packet, we write our update into it
+-- if we used Think, then we might write an update more than once, wasting performance and buffer space
+util.AddNetworkString("AudioSystem_Update")
+hook.Add("SetupPlayerVisibility", "AudioSystem:AudioSystem", function(ply)
+	local transmitData = AudioSystem.TransmitData[ply]
+	if not transmitData then return end
+
+	local count = #transmitData.pending
+	if count == 0 then return end
+
+	local maxEntries = math.pow(2, NetworkSettings._COUNT_BITS) - 1
+	if count > maxEntries then
+		count = maxEntries
+	end
+
+	net.Start("AudioSystem_Update", NetworkSettings._UNRELIABLE)
+		net.WriteUInt(engine.TickCount(), 32)
+		net.WriteUInt(count, NetworkSettings._COUNT_BITS)
+		for idx, transmitEntry in ipairs(transmitData.pending) do
+			if idx > maxEntries then break end
+
+			net.WriteUInt(transmitEntry.tick, 32)
+			net.WriteUInt(transmitEntry.type.ID, NetworkSettings._ID_BITS)
+			local func = transmitEntry.type.ProcessFunc
+			if func then
+				func(transmitEntry.data, ply)
+			else
+				net.Abort()
+				ErrorNoHaltWithStack("Tried to network an update with no function!")
+				table.remove(transmitData.pending, idx) -- Get rid of the invalid entry
+				return
+			end
+		end
+	net.Send(ply)
+
+	if not NetworkSettings._UNRELIABLE then
+		transmitData.pending = {}
+	end
+end)
 
 util.AddNetworkString("AudioSystem_StopSound")
 function AudioSystem.StopSound(identifier, fadeOut, entity, sendToEntity)
 	fadeOut = fadeOut or 0
 
-	local isValid = IsValid(entity)
-	net.Start("AudioSystem_StopSound")
-		WriteSoundField(identifier, net.WriteString) -- if given nil as a identifier we will stop all sounds.
-		net.WriteFloat(fadeOut)
-		WriteSoundField(entity, WriteEntIndex)
-	if not sendToEntity then
-		net.Broadcast()
-	else
-		if isnumber(sendToEntity) and team.Valid(sendToEntity) then
-			sendToEntity = team.GetPlayers(sendToEntity)
-		end
-
-		net.Send(sendToEntity)
+	if not isnumber(fadeOut) then
+		error("fadeOut is not a number!")
 	end
+
+	if entity ~= nil and not IsEntity(entity) then
+		error("entity is not an Entity!")
+	end
+
+	local data = {
+		identifier = identifier,
+		fadeOut = fadeOut,
+		entity = entity,
+	}
+
+	AddToTransmits(sendToEntity, NetworkSettings.StopSound, data)
 end
 
-util.AddNetworkString("AudioSystem_FadeSound")
-function AudioSystem.FadeSound(identifier, fadeTime, targetVolume) -- ToDo: Fix this function.
-	net.Start("AudioSystem_FadeSound")
-		net.WriteString(identifier)
-		net.WriteFloat(fadeTime)
-		net.WriteFloat(targetVolume)
-	net.Broadcast()
+function NetworkSettings.StopSound.ProcessFunc(data)
+	WriteSoundField(data.identifier, net.WriteString) -- if given nil as a identifier we will stop all sounds.
+	net.WriteFloat(data.fadeOut)
+	WriteSoundField(data.entity, WriteEntIndex)
+end
+
+function AudioSystem.FadeSound(identifier, fadeTime, targetVolume) -- ToDo: Fix this function. Update: naah
+	fadeTime = fadeTime or 0
+
+	if not isnumber(fadeTime) then
+		error("fadeTime is not a number!")
+	end
+
+	if not isnumber(targetVolume) then
+		error("targetVolume is not a number!")
+	end
+
+	local data = {
+		identifier = identifier,
+		fadeTime = fadeTime,
+		targetVolume = targetVolume,
+	}
+
+	AddToTransmits(nil, NetworkSettings.FadeSound, data)
+end
+
+function NetworkSettings.FadeSound.ProcessFunc(data)
+	net.WriteString(data.identifier)
+	net.WriteFloat(data.fadeTime)
+	net.WriteFloat(data.targetVolume)
 end
 
 util.AddNetworkString("AudioSystem_AcknowledgeDelta")
@@ -334,22 +438,49 @@ net.Receive("AudioSystem_MissingDelta", function(_, ply)
 	-- print("Sent delta recovery")
 end)
 
-util.AddNetworkString("AudioSystem_EntityRemoved")
-hook.Add("EntityRemoved", "AudioSystem:EntityRemoved", function(ent)
-	net.Start("AudioSystem_EntityRemoved")
-		net.WriteUInt(ent:EntIndex(), MAX_EDICT_BITS)
-	net.Broadcast()
+util.AddNetworkString("AudioSystem_Acknowledge")
+net.Receive("AudioSystem_Acknowledge", function(_, ply)
+	local transmitData = AudioSystem.TransmitData[ply]
+	if not transmitData then return end
+
+	local tickCount = engine.TickCount()
+	transmitData._LAST_ACK = net.ReadUInt(32)
+	if transmitData._LAST_ACK > tickCount then
+		transmitData._LAST_ACK = tickCount -- In case it somehow screwed up???
+	end
+
+	for idx, transmitEntry in ipairs(transmitData.pending) do
+		if transmitEntry.tick <= transmitData._LAST_ACK then
+			table.remove(transmitData.pending, idx)
+		end
+	end
 end)
 
-util.AddNetworkString("AudioSystem_SetGroupVolume")
-function AudioSystem.SetGroupVolume(groupName, groupVolume, lerpTime, sendToEntity)
-	net.Start("AudioSystem_SetGroupVolume")
-		net.WriteString(groupName)
-		net.WriteFloat(groupVolume)
-		net.WriteFloat(lerpTime)
-	if not sendToEntity then
-		net.Broadcast()
-	else
-		net.Send(sendToEntity)
+hook.Add("EntityRemoved", "AudioSystem:EntityRemoved", function(ent)
+	AddToTransmits(nil, NetworkSettings.EntityRemoved, ent:EntIndex())
+
+	if ent:IsPlayer() then
+		AudioSystem.TransmitData[ent] = nil
+		AudioSystem.PlayerDeltaSoundCache[ent] = nil
 	end
+end)
+
+function NetworkSettings.EntityRemoved.ProcessFunc(entIndex)
+	net.WriteUInt(entIndex, MAX_EDICT_BITS)
+end
+
+function AudioSystem.SetGroupVolume(groupName, groupVolume, lerpTime, sendToEntity)
+	local data = {
+		groupName = groupName,
+		groupVolume = groupVolume,
+		lerpTime = lerpTime,
+	}
+
+	AddToTransmits(sendToEntity, NetworkSettings.SetGroupVolume, data)
+end
+
+function NetworkSettings.SetGroupVolume.ProcessFunc(data)
+	net.WriteString(data.groupName)
+	net.WriteFloat(data.groupVolume)
+	net.WriteFloat(data.lerpTime)
 end
